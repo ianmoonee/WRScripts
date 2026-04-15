@@ -1,0 +1,14 @@
+[
+    {
+        "Branch": "cert_code_cleaning",
+        "BranchWassp": "wassp-jenkins",
+        "matrix": "vx7GOS.xls",
+        "testNameDir": "vpx1708-gos-cert-tests"
+    },
+    {
+        "colrow": "H:421"
+    },
+    {
+        "colrow": "H:422"
+    }
+]

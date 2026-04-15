@@ -1,0 +1,38 @@
+{
+    "components": {
+        "boot_app": {
+            "targets": [
+                {
+                    "target": ["42441", "93870"],
+                    "commands": [
+                        {
+                            "cmd": "programTBT",
+                            "wait_for": "value = 0 = 0x0",
+                            "timeout": 5
+                        },
+                        {
+                            "cmd": "programBKDB",
+                            "wait_for": "value = 1 = 0x1",
+                            "timeout": 10
+                        }
+                    ]
+                },
+                {
+                    "target": ["62824", "75619"],
+                    "commands": [
+                        {
+                            "cmd": "programTBT",
+                            "wait_for": "value = 0 = 0x0",
+                            "timeout": 5
+                        },
+                        {
+                            "cmd": "programBKDB",
+                            "wait_for": "value = 1 = 0x1",
+                            "timeout": 10
+                        }
+                    ]
+                }
+            ]
+        }
+    }
+}
