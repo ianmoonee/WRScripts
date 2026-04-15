@@ -11,6 +11,8 @@ Environment Variables Required:
 - POLARION_API_BASE: Base URL for Polarion API
 - POLARION_PAT: Personal Access Token for authentication
 - POLARION_PROJECT_ID: Project ID in Polarion (can also be provided via --project-id)
+- CCN_LOGIN: CodeCollaborator username (required when --ccr-id is provided)
+- CCN_PASSWORD: CodeCollaborator password (required when --ccr-id is provided)
 
 Usage:
     python polarionTestProcedureManager.py --repo-path /path/to/wassp --ccr-id 28264 [--dry-run|--execute]
@@ -22,16 +24,99 @@ import argparse
 import glob
 import re
 import json
+import subprocess
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuple
-from pathlib import Path
+from typing import List, Dict, Optional, Tuple, Any
 
-# Reuse the Polarion API client from the existing script
-from polarionLinkChanger import PolarionSourceLinkUpdater
+import requests
+import urllib3
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+
+class PolarionSourceLinkUpdater:
+    """Minimal Polarion REST API client for work item operations."""
+
+    def __init__(self, base_url: str, pat: str, project_id: str,
+                 verify_ssl: bool = False, verbose: bool = False):
+        self.base_url = base_url.rstrip('/')
+        self.pat = pat
+        self.project_id = project_id
+        self.verify_ssl = verify_ssl
+        self.verbose = verbose
+        self.session = requests.Session()
+        self.session.headers.update({
+            'Authorization': f'Bearer {pat}',
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+        })
+        self.session.verify = verify_ssl
+
+    def query_work_items(self, query: str) -> List[str]:
+        """Query Polarion for work items matching the query. Returns list of work item IDs."""
+        print(f"Querying Polarion with: {query}")
+        url = f"{self.base_url}/projects/{self.project_id}/workitems"
+        params = {
+            'query': query,
+            'fields[workitems]': 'id,type,hyperlinks,title,status',
+        }
+        response = self.session.get(url, params=params, verify=self.verify_ssl)
+        if response.status_code != 200:
+            print(f"Error querying Polarion: {response.status_code}")
+            print(f"Response: {response.text[:500]}")
+            return []
+        data = response.json()
+        work_item_ids = []
+        if isinstance(data, dict) and 'data' in data:
+            items = data['data']
+            if isinstance(items, list):
+                for item in items:
+                    if isinstance(item, dict) and 'id' in item:
+                        work_item_ids.append(item['id'])
+        print(f"Found {len(work_item_ids)} work items matching query")
+        return work_item_ids
+
+    @staticmethod
+    def _extract_short_id(work_item_id: str) -> str:
+        """Extract short ID from full work item ID (e.g. 'project/ITEM-123' -> 'ITEM-123')."""
+        if '/' in work_item_id:
+            return work_item_id.split('/')[-1]
+        return work_item_id
+
+    def update_work_item_attributes(self, work_item_id: str, attributes: Dict[str, Any],
+                                     dry_run: bool = True) -> bool:
+        """Update any work item attributes via PATCH."""
+        if dry_run:
+            return True
+        short_id = self._extract_short_id(work_item_id)
+        url = f"{self.base_url}/projects/{self.project_id}/workitems/{short_id}"
+        payload = {
+            'data': {
+                'type': 'workitems',
+                'id': work_item_id,
+                'attributes': attributes,
+            }
+        }
+        response = self.session.patch(url, json=payload, verify=self.verify_ssl)
+        if response.status_code in (200, 204):
+            return True
+        print(f"  ✗ Error updating work item: {response.status_code}")
+        print(f"    Response: {response.text[:500]}")
+        return False
+
+    def update_work_item_status(self, work_item_id: str, new_status: str, dry_run: bool = True) -> bool:
+        """Update work item status."""
+        return self.update_work_item_attributes(work_item_id, {'status': new_status}, dry_run=dry_run)
+
+    def update_work_item_hyperlinks(self, work_item_id: str, updated_hyperlinks: List[Dict],
+                                    dry_run: bool = True) -> bool:
+        """Update all hyperlinks for a work item."""
+        cleaned = [{'role': l['role'], 'uri': l['uri']} for l in updated_hyperlinks]
+        return self.update_work_item_attributes(work_item_id, {'hyperlinks': cleaned}, dry_run=dry_run)
 
 RELATIVE_TEST_PATH = os.path.join(
     "helix", "guests", "vxworks-7", "pkgs_v2", "test",
-    "shallowford-cert-tests", "native"
+    "shallowford-cert-tests", "SFORD_POS"
 )
 
 DEFAULT_GITLAB_BASE = (
@@ -55,9 +140,14 @@ class TpFileInfo:
     # Test case names extracted from tp file comments
     tc_names: List[str] = field(default_factory=list)
 
+    # Optional override for the Polarion component name
+    component_override: Optional[str] = None
+
     @property
     def component(self) -> str:
-        """Derive Polarion component from variant (strip SBL_ prefix)."""
+        """Derive Polarion component from variant (strip SBL_ prefix), or use override."""
+        if self.component_override:
+            return self.component_override
         if self.boot_app_variant.startswith("SBL_"):
             return self.boot_app_variant[4:]
         return self.boot_app_variant
@@ -139,9 +229,11 @@ def parse_tc_names_from_file(tp_path: str, include_srvc: bool = False, verbose: 
     return tc_names
 
 
-def discover_tp_files(repo_path: str, include_srvc: bool = False, verbose: bool = False) -> List[TpFileInfo]:
+def discover_tp_files(repo_path: str, include_srvc: bool = False, verbose: bool = False,
+                      component_glob: str = "SBL_BOOT_APP0*",
+                      component_override: Optional[str] = None) -> List[TpFileInfo]:
     """
-    Scan the repo for tp_*.c files in SBL_BOOT_APP0*/HLTP and SBL_BOOT_APP0*/LLTP.
+    Scan the repo for tp_*.c files in <component_glob>/HLTP and <component_glob>/LLTP.
     """
     native_dir = os.path.join(repo_path, RELATIVE_TEST_PATH)
     if not os.path.isdir(native_dir):
@@ -150,12 +242,12 @@ def discover_tp_files(repo_path: str, include_srvc: bool = False, verbose: bool 
 
     results: List[TpFileInfo] = []
 
-    # Find all SBL_BOOT_APP0* directories
-    pattern = os.path.join(native_dir, "SBL_BOOT_APP0*")
+    # Find all matching component directories
+    pattern = os.path.join(native_dir, component_glob)
     boot_app_dirs = sorted(glob.glob(pattern))
 
     if not boot_app_dirs:
-        print(f"Warning: No SBL_BOOT_APP0* directories found in {native_dir}")
+        print(f"Warning: No directories matching '{component_glob}' found in {native_dir}")
         return results
 
     for boot_app_dir in boot_app_dirs:
@@ -251,6 +343,7 @@ def discover_tp_files(repo_path: str, include_srvc: bool = False, verbose: bool 
                         dir_path=search_dir,
                         rel_dir=rel_dir,
                         tc_names=tc_names,
+                        component_override=component_override,
                     )
                     results.append(info)
 
@@ -275,8 +368,10 @@ def query_existing_work_items(
     Returns list of (work_item_id, title, number_suffix) sorted by number.
     """
     test_name, test_type = group_key.rsplit("_", 1)
+    # Strip leading underscores — Polarion Lucene cannot handle them in title queries
+    query_test_name = test_name.lstrip("_")
     # Lucene query: type + title wildcard (no quotes — wildcards are literal inside quotes)
-    query = f'NOT HAS_VALUE:resolution AND NOT status:deleted AND type:wi_testProcedure AND title:{test_name}_{test_type}_*'
+    query = f'NOT HAS_VALUE:resolution AND NOT status:deleted AND type:wi_testProcedure AND title:{query_test_name}_{test_type}_*'
 
     if verbose:
         print(f"  [VERBOSE] Querying: {query}")
@@ -297,12 +392,11 @@ def query_existing_work_items(
         title = data.get("data", {}).get("attributes", {}).get("title", "")
 
         # Extract the trailing number from e.g. applyWriteProtect_HLTP_1
-        match = re.search(rf"{re.escape(test_name)}_{re.escape(test_type)}_(\d+)$", title)
+        match = re.search(rf"^{re.escape(test_name)}_{re.escape(test_type)}_(\d+)$", title)
         if match:
             num = int(match.group(1))
             results.append((wi_id, title, num))
-        elif verbose:
-            print(f"  [VERBOSE] Title '{title}' did not match expected pattern, skipping")
+            print(f"      -> {short_id} - {title}")
 
     results.sort(key=lambda x: x[2])
     return results
@@ -385,17 +479,20 @@ def update_existing_work_item(
     tp_file: TpFileInfo,
     gitlab_base: str,
     ccr_id: str,
+    component: str,
+    category: str,
     dry_run: bool = True,
     verbose: bool = False,
 ) -> bool:
-    """Update an existing work item's hyperlinks."""
+    """Update an existing work item's hyperlinks, component, and category."""
     short_id = updater._extract_short_id(wi_id)
     print(f"\n  Updating: {short_id} - {wi_title}")
     print(f"    Matched to: {tp_file.boot_app_variant}/{tp_file.test_type}/{tp_file.tp_filename}")
 
     # Fetch current hyperlinks
     url = f"{updater.base_url}/projects/{updater.project_id}/workitems/{short_id}"
-    params = {"fields[workitems]": "hyperlinks,status"}
+    params = {"fields[workitems]": "hyperlinks,status,fld_component",
+              "fields[categories]": "@all"}
     resp = updater.session.get(url, params=params, verify=updater.verify_ssl)
     if resp.status_code != 200:
         print(f"    Error fetching work item: {resp.status_code}")
@@ -405,6 +502,7 @@ def update_existing_work_item(
     attrs = data.get("data", {}).get("attributes", {})
     current_links = attrs.get("hyperlinks", [])
     current_status = attrs.get("status", "")
+    current_component = attrs.get("fld_component", "")
 
     # Build new source reference links
     tl_url, tp_url = build_gitlab_urls(tp_file, gitlab_base)
@@ -453,6 +551,12 @@ def update_existing_work_item(
             print(f"      + {ccr_url}")
         elif ccr_url:
             print(f"    [DRY RUN] CCR link already exists, skipping")
+        # Component
+        desired_component = f"comp_{component}"
+        if current_component != desired_component:
+            print(f"    [DRY RUN] Would update fld_component from '{current_component}' to '{desired_component}'")
+        # Category
+        print(f"    [DRY RUN] Would set fld_category to '{category}'")
         return True
 
     # Execute: status -> rework
@@ -470,6 +574,37 @@ def update_existing_work_item(
         print(f"    ✗ Failed to update hyperlinks")
         return False
 
+    # Execute: update fld_component
+    desired_component = f"comp_{component}"
+    if current_component != desired_component:
+        if updater.update_work_item_attributes(wi_id, {"fld_component": desired_component}, dry_run=False):
+            print(f"    ✓ Component updated to '{desired_component}'")
+        else:
+            print(f"    ✗ Failed to update component")
+
+    # Execute: update fld_category via work item PATCH with relationships
+    cat_url = f"{updater.base_url}/projects/{updater.project_id}/workitems/{short_id}"
+    cat_payload = {
+        "data": {
+            "type": "workitems",
+            "id": wi_id,
+            "relationships": {
+                "fld_category": {
+                    "data": {
+                        "type": "categories",
+                        "id": f"{updater.project_id}/cat_{category}",
+                    }
+                }
+            },
+        }
+    }
+    cat_resp = updater.session.patch(cat_url, json=cat_payload, verify=updater.verify_ssl)
+    if cat_resp.status_code in (200, 204):
+        print(f"    ✓ Category updated to '{category}'")
+    else:
+        print(f"    ✗ Failed to update category: {cat_resp.status_code}")
+        print(f"      Response: {cat_resp.text[:500]}")
+
     # Note: status -> in_review is done after TC linking in the main flow
     return True
 
@@ -480,13 +615,14 @@ def create_new_work_item(
     tp_file: TpFileInfo,
     gitlab_base: str,
     ccr_id: str,
+    component: str,
+    category: str,
     author: Optional[str] = None,
     dry_run: bool = True,
     verbose: bool = False,
 ) -> Optional[str]:
     """Create a new test procedure work item. Returns the created WI ID, or None on failure."""
     title = f"{tp_file.test_name}_{tp_file.test_type}_{number}"
-    component = tp_file.component
 
     # Build hyperlinks
     tl_url, tp_url = build_gitlab_urls(tp_file, gitlab_base)
@@ -521,24 +657,16 @@ def create_new_work_item(
                     "title": title,
                     "status": "rework",
                     "executionType": "Automated",
+                    "fld_executionType": "automated",
+                    "fld_component": f"comp_{component}",
                     "hyperlinks": hyperlinks,
                 },
                 "relationships": {
-                    "categories": {
-                        "data": [
-                            {
-                                "type": "categories",
-                                "id": f"{updater.project_id}/VXBVIP",
-                            }
-                        ]
-                    },
-                    "components": {
-                        "data": [
-                            {
-                                "type": "components",
-                                "id": f"{updater.project_id}/{component}",
-                            }
-                        ]
+                    "fld_category": {
+                        "data": {
+                            "type": "categories",
+                            "id": f"{updater.project_id}/cat_{category}",
+                        }
                     },
                     **({
                         "author": {
@@ -768,6 +896,155 @@ def link_test_cases_to_tp(
 
 
 # ---------------------------------------------------------------------------
+# CCR Branch Resolution & Git Checkout
+# ---------------------------------------------------------------------------
+
+CCN_API_BASE = "https://ccn-codecolab.wrs.com:8443/services/json/v1"
+
+
+def resolve_ccr_branch(ccr_id: str, verbose: bool = False) -> str:
+    """
+    Query the CCN CodeCollaborator API to resolve a CCR review ID
+    to its WASSP branch name.
+
+    Requires CCN_LOGIN and CCN_PASSWORD environment variables.
+    Returns the branch name string, or exits on failure.
+    """
+    ccn_login = os.environ.get("CCN_LOGIN")
+    ccn_password = os.environ.get("CCN_PASSWORD")
+
+    if not ccn_login:
+        print("Error: CCN_LOGIN environment variable is not set (required when --ccr-id is provided)")
+        sys.exit(1)
+    if not ccn_password:
+        print("Error: CCN_PASSWORD environment variable is not set (required when --ccr-id is provided)")
+        sys.exit(1)
+
+    session = requests.Session()
+
+    # Get login ticket
+    login_req = [
+        {
+            "command": "SessionService.getLoginTicket",
+            "args": {
+                "login": ccn_login,
+                "password": ccn_password,
+            },
+        }
+    ]
+    resp = session.post(CCN_API_BASE, json=login_req, verify=False)
+    data = resp.json()
+    if "errors" in data[0]:
+        print(f"Error: CCN login failed: {data[0]['errors']}")
+        sys.exit(1)
+    login_ticket = data[0]["result"]["loginTicket"]
+
+    # Authenticate and find the review
+    validate_req = [
+        {
+            "command": "SessionService.authenticate",
+            "args": {"login": ccn_login, "ticket": login_ticket},
+        },
+        {
+            "command": "ReviewService.findReviewById",
+            "args": {"reviewId": int(ccr_id)},
+        },
+    ]
+    resp2 = session.post(CCN_API_BASE, json=validate_req, verify=False)
+    validate_data = resp2.json()
+    if "errors" in validate_data[0]:
+        print(f"Error: CCN authentication failed")
+        sys.exit(1)
+    if "errors" in validate_data[1]:
+        print(f"Error: CCR #{ccr_id} not found: {validate_data[1]['errors']}")
+        sys.exit(1)
+
+    # Get review summary to extract branch name
+    summary_req = [
+        {
+            "command": "SessionService.authenticate",
+            "args": {"login": ccn_login, "ticket": login_ticket},
+        },
+        {
+            "command": "ReviewService.getReviewSummary",
+            "args": {"reviewId": int(ccr_id), "clientBuild": "14401"},
+        },
+    ]
+    resp_sum = session.post(CCN_API_BASE, json=summary_req, verify=False)
+    summary_data = resp_sum.json()
+    if "errors" in summary_data[1]:
+        print(f"Error: Failed to fetch review summary for CCR #{ccr_id}")
+        sys.exit(1)
+
+    summary = summary_data[1].get("result", {})
+    pull_request_merges = summary.get("pullRequestMerges", [])
+    merge_message = pull_request_merges[0].get("mergeMessage", "") if pull_request_merges else ""
+
+    branch_name = None
+    if merge_message:
+        parts = merge_message.split("'")
+        if len(parts) >= 2:
+            branch_name = parts[1]
+
+    if not branch_name:
+        print(f"Error: Could not extract branch name from CCR #{ccr_id}")
+        sys.exit(1)
+
+    if verbose:
+        print(f"  [VERBOSE] CCR #{ccr_id} -> branch '{branch_name}'")
+
+    return branch_name
+
+
+def checkout_wassp_branch(repo_path: str, branch_name: str, verbose: bool = False) -> None:
+    """
+    Fetch all remotes and checkout the given branch in the wassp repo.
+    Exits on failure.
+    """
+    try:
+        subprocess.check_output(
+            ["git", "fetch", "--all", "--prune"],
+            stderr=subprocess.PIPE, text=True, cwd=repo_path,
+        )
+        if verbose:
+            print(f"  [VERBOSE] git fetch --all --prune succeeded")
+    except subprocess.CalledProcessError as e:
+        print(f"Warning: git fetch failed: {e}")
+
+    try:
+        subprocess.check_output(
+            ["git", "checkout", branch_name],
+            stderr=subprocess.PIPE, text=True, cwd=repo_path,
+        )
+        print(f"  Checked out branch '{branch_name}' in {repo_path}")
+    except subprocess.CalledProcessError:
+        # Branch may not exist locally yet — try tracking the remote
+        try:
+            subprocess.check_output(
+                ["git", "checkout", "-b", branch_name, f"origin/{branch_name}"],
+                stderr=subprocess.PIPE, text=True, cwd=repo_path,
+            )
+            print(f"  Checked out new tracking branch '{branch_name}' in {repo_path}")
+        except subprocess.CalledProcessError as e:
+            print(f"Error: Failed to checkout branch '{branch_name}': {e}")
+            sys.exit(1)
+
+    # Pull latest changes
+    try:
+        subprocess.check_output(
+            ["git", "pull"],
+            stderr=subprocess.PIPE, text=True, cwd=repo_path,
+        )
+        if verbose:
+            print(f"  [VERBOSE] git pull succeeded on branch '{branch_name}'")
+    except subprocess.CalledProcessError as e:
+        print(f"Error: git pull failed on branch '{branch_name}': {e}")
+        sys.exit(1)
+
+    print(f"  Changed wassp branch to CCR branch: {branch_name}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -846,6 +1123,21 @@ Examples:
         help="Also parse TC names from testCases_Srvc arrays (by default only testCases_Init is parsed)",
     )
     parser.add_argument(
+        "--component-glob",
+        default="SBL_BOOT_APP0*",
+        help="Glob pattern for component directories under native/ (default: SBL_BOOT_APP0*)",
+    )
+    parser.add_argument(
+        "--component",
+        required=True,
+        help="Polarion component name (e.g. SSD_NVME0). Will be prefixed with comp_ automatically.",
+    )
+    parser.add_argument(
+        "--category",
+        default="BSP_POS",
+        help="Polarion category ID (default: BSP_POS). Will be prefixed with cat_ automatically.",
+    )
+    parser.add_argument(
         "--author",
         default=None,
         help="Polarion user ID to set as author on newly created work items (optional)",
@@ -886,9 +1178,17 @@ Examples:
         print("EXECUTE MODE - Changes will be applied!")
     print("=" * 60)
 
+    # Phase 0: Resolve CCR branch and checkout
+    if args.ccr_id:
+        print(f"\nPhase 0: Resolving CCR #{args.ccr_id} branch and checking out...")
+        branch_name = resolve_ccr_branch(args.ccr_id, verbose=args.verbose)
+        checkout_wassp_branch(repo_path, branch_name, verbose=args.verbose)
+
     # Phase 1: discover files
     print(f"\nPhase 1: Discovering tp files in {repo_path}")
-    tp_files = discover_tp_files(repo_path, include_srvc=args.include_srvc, verbose=args.verbose)
+    tp_files = discover_tp_files(repo_path, include_srvc=args.include_srvc, verbose=args.verbose,
+                                 component_glob=args.component_glob,
+                                 component_override=args.component)
     if not tp_files:
         print("No tp files found. Nothing to do.")
         return
@@ -920,6 +1220,45 @@ Examples:
     print(f"  Work items to update: {len(match_result.updates)}")
     print(f"  Work items to create: {len(match_result.creates)}")
 
+    # --- Change log (grouped by function) ---
+    entries_by_group: Dict[str, List[str]] = {}
+    for wi_id, wi_title, tp_file in match_result.updates:
+        short_id = updater._extract_short_id(wi_id)
+        tl_url, tp_url = build_gitlab_urls(tp_file, args.gitlab_base)
+        lines = [f"  [WOULD UPDATE] {short_id} - {wi_title}"]
+        for tc_name in tp_file.tc_names:
+            lines.append(f"      [implements] {tc_name}")
+        lines.append("")
+        if tl_url:
+            lines.append(f"      [source reference] {tl_url}")
+        lines.append(f"      [source reference] {tp_url}")
+        entries_by_group.setdefault(tp_file.group_key, []).append("\n".join(lines))
+
+    for number, tp_file in match_result.creates:
+        title = f"{tp_file.test_name}_{tp_file.test_type}_{number}"
+        tl_url, tp_url = build_gitlab_urls(tp_file, args.gitlab_base)
+        lines = [f"  [WOULD CREATE] {title}"]
+        for tc_name in tp_file.tc_names:
+            lines.append(f"      [implements] {tc_name}")
+        lines.append("")
+        if tl_url:
+            lines.append(f"      [source reference] {tl_url}")
+        lines.append(f"      [source reference] {tp_url}")
+        entries_by_group.setdefault(tp_file.group_key, []).append("\n".join(lines))
+
+    if entries_by_group:
+        print(f"\nChange log:")
+        first_group = True
+        for group_key in sorted(entries_by_group.keys()):
+            if not first_group:
+                print("  " + "-" * 40)
+            first_group = False
+            group_entries = entries_by_group[group_key]
+            for i, entry in enumerate(group_entries):
+                print(entry)
+                if i < len(group_entries) - 1:
+                    print()
+
     # Phase 3: update existing work items
     updated_ok = 0
     updated_fail = 0
@@ -936,6 +1275,7 @@ Examples:
             if update_existing_work_item(
                 updater, wi_id, wi_title, tp_file,
                 args.gitlab_base, args.ccr_id,
+                component=args.component, category=args.category,
                 dry_run=dry_run, verbose=args.verbose,
             ):
                 updated_ok += 1
@@ -969,6 +1309,7 @@ Examples:
             created_id = create_new_work_item(
                 updater, number, tp_file,
                 args.gitlab_base, args.ccr_id,
+                component=args.component, category=args.category,
                 author=args.author,
                 dry_run=dry_run, verbose=args.verbose,
             )
