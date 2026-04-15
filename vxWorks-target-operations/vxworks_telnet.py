@@ -6,6 +6,7 @@ reboots it via a local command (vlmTool), stops autoboot,
 boots VxWorks, and runs a configured set of commands.
 """
 
+import fcntl
 import telnetlib
 import json
 import re
@@ -24,9 +25,38 @@ DEFAULT_AUTOBOOT_PATTERN = "Hit any key to stop autoboot"
 DEFAULT_BOOT_CMD = "run bootprov"
 REBOOT_CMD_TEMPLATE = "vlmTool reboot -t {target}"
 RESERVE_CMD_TEMPLATE = "vlmTool reserve -t {target}"
+LOCK_DIR = os.path.dirname(os.path.abspath(__file__))
 FORCE_RESERVE_CMD_TEMPLATE = "vlmTool reserve -t {target} -f"
 RESERVE_NOTE_CMD_TEMPLATE = 'vlmTool reserveNote -t {target} -n "copying_images"'
 UNRESERVE_CMD_TEMPLATE = "vlmTool unreserve -t {target}"
+
+
+def acquire_target_lock(target_name):
+    """Acquire an exclusive file lock for a target.
+
+    Returns the open file handle (keep it open to hold the lock), or
+    None if another instance already holds the lock.
+    """
+    lock_path = os.path.join(LOCK_DIR, f".{target_name}.lock")
+    lock_file = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_file.write(str(os.getpid()))
+        lock_file.flush()
+        return lock_file
+    except (IOError, OSError):
+        lock_file.close()
+        return None
+
+
+def release_target_locks(locks):
+    """Release and close a list of lock file handles."""
+    for lock_file in locks:
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+            lock_file.close()
+        except Exception:
+            pass
 
 
 class log:
@@ -383,8 +413,9 @@ if __name__ == "__main__":
     targets_def, commands_def = load_config(commands_path, targets_path, component)
     log.info(f"Running component: {component}")
 
-    # Track currently reserved targets for cleanup on signal
+    # Track currently reserved targets and held locks for cleanup on signal
     reserved_targets = set()
+    held_locks = []
 
     def _cleanup_and_exit(signum, frame):
         sig_name = signal.Signals(signum).name
@@ -395,6 +426,7 @@ if __name__ == "__main__":
                 VxWorksTelnet.unreserve_target(t)
             except Exception:
                 pass
+        release_target_locks(held_locks)
         os._exit(1)
 
     signal.signal(signal.SIGINT, _cleanup_and_exit)
@@ -423,6 +455,19 @@ if __name__ == "__main__":
     # Process each backplane group: reserve once, run all targets, unreserve once
     for backplane, entries in backplane_groups.items():
         reserve_target_name = entries[0]["target"]
+
+        # Acquire file locks for all targets in this backplane group
+        target_names = [e["target"] for e in entries]
+        group_locks = []
+        for tname in target_names:
+            lock = acquire_target_lock(tname)
+            if lock is None:
+                log.info(f"Target '{tname}' is already being processed by another instance. Exiting.")
+                release_target_locks(group_locks)
+                os._exit(0)
+            group_locks.append(lock)
+        held_locks.extend(group_locks)
+
         try:
             VxWorksTelnet.reserve_target(reserve_target_name)
             reserved_targets.add(reserve_target_name)
@@ -465,5 +510,10 @@ if __name__ == "__main__":
             except Exception:
                 pass
             os._exit(1)
+        finally:
+            release_target_locks(group_locks)
+            for l in group_locks:
+                if l in held_locks:
+                    held_locks.remove(l)
 
     os._exit(0)
