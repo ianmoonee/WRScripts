@@ -434,6 +434,24 @@ for idx, entry in enumerate(ccr_data):
             except subprocess.CalledProcessError:
                 continue
 
+        # Fallback: if no older CCR had a commit for this file,
+        # use the oldest commit on the current CCR's own branch.
+        if prev_hash == "N/A" and BRANCH_NAME:
+            ref = "origin/" + BRANCH_NAME
+            cmd = ["git", "log", ref, "--no-merges",
+                     "--pretty=format:%h", "--", fp]
+            if DEBUG:
+                print("[DEBUG] prev_hash fallback cmd: {}".format(" ".join(cmd)))
+            try:
+                out = subprocess.check_output(cmd, text=True, stderr=subprocess.PIPE, cwd=WASSP_PATH).strip()
+                if out:
+                    prev_hash = out.splitlines()[-1]
+                    if DEBUG:
+                        print("[DEBUG] prev_hash fallback result: {!r}".format(prev_hash))
+            except subprocess.CalledProcessError as e:
+                if DEBUG:
+                    print("[DEBUG] prev_hash fallback failed: {}".format(e))
+
         file_hashes.append({"path": fp, "current": current_hash, "prev": prev_hash})
 
     # Print grouped output: header, latest change list, then previous change list
@@ -459,39 +477,37 @@ for idx, entry in enumerate(ccr_data):
     # Skipped when --dry-run is set.
     # =========================================================================
 
-    # Build "Ending Version(s)" from latest-change hashes (skip N/A)
+    # Build "Ending Version(s)" from latest-change hashes
     ending_entries = []
     for fh in file_hashes:
-        if fh["current"] != "N/A":
-            display = format_path(fh["path"], MODE)
-            if DEBUG:
-                print("[DEBUG] Ending: '{}' -> '{}'".format(fh["path"], display))
-            ending_entries.append((display, fh["current"]))
+        display = format_path(fh["path"], MODE)
+        if DEBUG:
+            print("[DEBUG] Ending: '{}' -> '{}'".format(fh["path"], display))
+        ending_entries.append((display, fh["current"]))
     if ending_entries:
         if MODE == "bsp":
             ending_value = group_by_directory(ending_entries)
         else:
             ending_value = "\n".join("{} - {}".format(p, h) for p, h in sorted(ending_entries))
     else:
-        ending_value = "N/A"
+        ending_value = ""
     if DEBUG:
         print("[DEBUG] Ending Version(s) value:\n{}".format(ending_value))
 
-    # Build "Starting Version(s)" from previous-change hashes (skip N/A)
+    # Build "Starting Version(s)" from previous-change hashes
     starting_entries = []
     for fh in file_hashes:
-        if fh["prev"] != "N/A":
-            display = format_path(fh["path"], MODE)
-            if DEBUG:
-                print("[DEBUG] Starting: '{}' -> '{}'".format(fh["path"], display))
-            starting_entries.append((display, fh["prev"]))
+        display = format_path(fh["path"], MODE)
+        if DEBUG:
+            print("[DEBUG] Starting: '{}' -> '{}'".format(fh["path"], display))
+        starting_entries.append((display, fh["prev"]))
     if starting_entries:
         if MODE == "bsp":
             starting_value = group_by_directory(starting_entries)
         else:
             starting_value = "\n".join("{} - {}".format(p, h) for p, h in sorted(starting_entries))
     else:
-        starting_value = "N/A"
+        starting_value = ""
     if DEBUG:
         print("[DEBUG] Starting Version(s) value:\n{}".format(starting_value))
 
@@ -505,7 +521,7 @@ for idx, entry in enumerate(ccr_data):
     if artifact_lines:
         artifact_value = "\n".join(sorted(artifact_lines) if MODE == "bl" else artifact_lines)
     else:
-        artifact_value = "N/A"
+        artifact_value = ""
 
     # Merge config fields with the dynamically generated fields
     dynamic_overrides = {
