@@ -114,9 +114,9 @@ class PolarionSourceLinkUpdater:
         cleaned = [{'role': l['role'], 'uri': l['uri']} for l in updated_hyperlinks]
         return self.update_work_item_attributes(work_item_id, {'hyperlinks': cleaned}, dry_run=dry_run)
 
-RELATIVE_TEST_PATH = os.path.join(
+RELATIVE_TEST_BASE = os.path.join(
     "helix", "guests", "vxworks-7", "pkgs_v2", "test",
-    "shallowford-cert-tests", "SFORD_POS"
+    "shallowford-cert-tests"
 )
 
 DEFAULT_GITLAB_BASE = (
@@ -235,9 +235,11 @@ def discover_tp_files(repo_path: str, include_srvc: bool = False, verbose: bool 
     """
     Scan the repo for tp_*.c files in <component_glob>/HLTP and <component_glob>/LLTP.
     """
-    native_dir = os.path.join(repo_path, RELATIVE_TEST_PATH)
+    # If component_glob starts with POSBSP, look under SFORD_POS; otherwise under native
+    subdir = "SFORD_POS" if component_glob.startswith("POSBSP") else "native"
+    native_dir = os.path.join(repo_path, RELATIVE_TEST_BASE, subdir)
     if not os.path.isdir(native_dir):
-        print(f"Error: native test directory not found: {native_dir}")
+        print(f"Error: test directory not found: {native_dir}")
         sys.exit(1)
 
     results: List[TpFileInfo] = []
@@ -1067,8 +1069,8 @@ Examples:
     )
     parser.add_argument(
         "--ccr-id",
-        default=None,
-        help="CCR review ID for internal reference hyperlinks (optional, skipped if not provided)",
+        required=True,
+        help="CCR review ID for internal reference hyperlinks and branch checkout",
     )
     parser.add_argument(
         "--gitlab-base",
@@ -1125,7 +1127,8 @@ Examples:
     parser.add_argument(
         "--component-glob",
         default="SBL_BOOT_APP0*",
-        help="Glob pattern for component directories under native/ (default: SBL_BOOT_APP0*)",
+        help="Glob pattern for component directories under native/ or SFORD_POS/ (default: SBL_BOOT_APP0*). "
+             "If the glob starts with POSBSP, searches under SFORD_POS/; otherwise under native/.",
     )
     parser.add_argument(
         "--component",
