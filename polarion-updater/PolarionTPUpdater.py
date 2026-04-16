@@ -1434,11 +1434,9 @@ Examples:
         branch_name = resolve_ccr_branch(ccr_id, verbose=args.verbose)
 
     if use_remote:
-        # Remote mode: build gitlab_base URL with the resolved branch
-        # Parse host+project from the default/provided gitlab-base
-        parts = args.gitlab_base.split("/-/")
-        gitlab_repo_url = parts[0] if len(parts) >= 2 else args.gitlab_base
-        gitlab_base = f"{gitlab_repo_url}/-/blob/{branch_name}"
+        # Remote mode: files are fetched from the CCR/feature branch,
+        # but hyperlinks use --gitlab-base as-is (e.g. wassp-jenkins).
+        gitlab_base = args.gitlab_base
         print(f"  Using remote mode (GitLab API) on branch '{branch_name}'")
         print(f"  Source reference base: {gitlab_base}")
 
