@@ -19,9 +19,9 @@ Environment Variables Required:
 - GITLAB_TOKEN: GitLab personal access token (required for remote mode)
 
 Usage:
-    python PolarionTPUpdater.py --ccr-id 28264 --component SSD_NVME0 [--dry-run|--execute]
-    python PolarionTPUpdater.py --branch my-feature-branch --component SSD_NVME0
-    python PolarionTPUpdater.py --repo-path /path/to/wassp --ccr-id 28264 --component SSD_NVME0
+    python PolarionTPUpdater.py --gitlab-base https://ccn-gitlab.wrs.com/shallowford/project/wassp/-/blob/wassp-jenkins --ccr-id 31421 --component-glob "POSBSP_SSD_NVME0*" --component SSD_NVME0 --dry-run
+    python PolarionTPUpdater.py --gitlab-base https://ccn-gitlab.wrs.com/shallowford/project/wassp/-/blob/wassp-jenkins --ccr-id 28264 --component-glob "SBL_BOOT_APP0*" --component BOOT_APP0 --execute
+    python PolarionTPUpdater.py --gitlab-base https://ccn-gitlab.wrs.com/shallowford/project/wassp/-/blob/wassp-jenkins --branch my-feature-branch --component SSD_NVME0 --component-glob "POSBSP_SSD_NVME0*"
 """
 
 import os
@@ -1270,10 +1270,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s --ccr-id 28264 --component SSD_NVME0 --dry-run
-  %(prog)s --ccr-id 28264 --component SSD_NVME0 --execute --limit 1
-  %(prog)s --branch my-feature-branch --component SSD_NVME0
-  %(prog)s --repo-path /path/to/wassp --ccr-id 28264 --component SSD_NVME0
+  %(prog)s --gitlab-base https://ccn-gitlab.wrs.com/shallowford/project/wassp/-/blob/wassp-jenkins --ccr-id 31421 --component-glob "POSBSP_SSD_NVME0*" --component SSD_NVME0 --dry-run
+  %(prog)s --gitlab-base https://ccn-gitlab.wrs.com/shallowford/project/wassp/-/blob/wassp-jenkins --ccr-id 28264 --component-glob "SBL_BOOT_APP0*" --component BOOT_APP0 --execute --limit 1
+  %(prog)s --gitlab-base https://ccn-gitlab.wrs.com/shallowford/project/wassp/-/blob/wassp-jenkins --branch my-feature-branch --component SSD_NVME0 --component-glob "POSBSP_SSD_NVME0*"
         """,
     )
 
