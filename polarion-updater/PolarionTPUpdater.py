@@ -62,7 +62,8 @@ class PolarionSourceLinkUpdater:
 
     def query_work_items(self, query: str) -> List[str]:
         """Query Polarion for work items matching the query. Returns list of work item IDs."""
-        print(f"Querying Polarion with: {query}")
+        if self.verbose:
+            print(f"  [VERBOSE] Querying Polarion with: {query}")
         url = f"{self.base_url}/projects/{self.project_id}/workitems"
         params = {
             'query': query,
@@ -81,7 +82,8 @@ class PolarionSourceLinkUpdater:
                 for item in items:
                     if isinstance(item, dict) and 'id' in item:
                         work_item_ids.append(item['id'])
-        print(f"Found {len(work_item_ids)} work items matching query")
+        if self.verbose:
+            print(f"  [VERBOSE] Found {len(work_item_ids)} work items matching query")
         return work_item_ids
 
     @staticmethod
@@ -610,7 +612,8 @@ def query_existing_work_items(
         if match:
             num = int(match.group(1))
             results.append((wi_id, title, num))
-            print(f"      -> {short_id} - {title}")
+            if verbose:
+                print(f"      -> {short_id} - {title}")
 
     results.sort(key=lambda x: x[2])
     return results
@@ -687,6 +690,20 @@ def _is_source_reference(link: dict) -> bool:
     return "ref_src" in role_id.lower() or "source" in role_id.lower()
 
 
+def _normalize_hyperlinks(links: List[Dict]) -> set:
+    """Normalize hyperlinks to a set of (role, uri) tuples for comparison."""
+    result = set()
+    for link in links:
+        role = link.get("role", "")
+        if isinstance(role, dict):
+            role = role.get("id", "")
+        else:
+            role = str(role)
+        uri = link.get("uri", "")
+        result.add((role, uri))
+    return result
+
+
 def update_existing_work_item(
     updater: PolarionSourceLinkUpdater,
     wi_id: str,
@@ -698,8 +715,11 @@ def update_existing_work_item(
     category: str,
     dry_run: bool = True,
     verbose: bool = False,
-) -> bool:
-    """Update an existing work item's hyperlinks, component, and category."""
+) -> Tuple[bool, bool]:
+    """Update an existing work item's hyperlinks, component, and category.
+
+    Returns (success, changes_needed).
+    """
     short_id = updater._extract_short_id(wi_id)
     print(f"\n  Updating: {short_id} - {wi_title}")
     print(f"    Matched to: {tp_file.boot_app_variant}/{tp_file.test_type}/{tp_file.tp_filename}")
@@ -711,7 +731,7 @@ def update_existing_work_item(
     resp = updater.session.get(url, params=params, verify=updater.verify_ssl)
     if resp.status_code != 200:
         print(f"    Error fetching work item: {resp.status_code}")
-        return False
+        return False, False
 
     data = resp.json()
     attrs = data.get("data", {}).get("attributes", {})
@@ -744,54 +764,80 @@ def update_existing_work_item(
     if ccr_url and ccr_url not in existing_uris:
         updated_hyperlinks.append(new_ccr_link)
 
-    # Report changes
+    # --- Alignment check (compare by URI sets — immune to role format differences) ---
+    current_uris = {link.get("uri", "") for link in current_links}
+    desired_uris = {link.get("uri", "") for link in updated_hyperlinks}
+    hyperlinks_aligned = current_uris == desired_uris
+
+    desired_component = f"comp_{component}"
+    component_aligned = current_component == desired_component
+
+    if verbose:
+        if not hyperlinks_aligned:
+            extra = current_uris - desired_uris
+            missing = desired_uris - current_uris
+            if extra:
+                print(f"    [VERBOSE] Hyperlinks to remove: {extra}")
+            if missing:
+                print(f"    [VERBOSE] Hyperlinks to add:    {missing}")
+        if not component_aligned:
+            print(f"    [VERBOSE] Component: '{current_component}' → '{desired_component}'")
+
+    if hyperlinks_aligned and component_aligned:
+        print(f"    ✓ Hyperlinks and component already aligned")
+        return True, False
+
+    # Changes needed — report details
     old_source = [link for link in current_links if _is_source_reference(link)]
     old_c_links = [link for link in current_links
                    if not _is_source_reference(link) and link.get("uri", "").endswith(".c")]
     if dry_run:
         if current_status != "rework":
             print(f"    [DRY RUN] Would change status from '{current_status}' to 'rework'")
-        print(f"    [DRY RUN] Would remove {len(old_source)} old source reference link(s):")
-        for link in old_source:
-            print(f"      - {link.get('uri', '?')}")
-        if old_c_links:
-            print(f"    [DRY RUN] Would remove {len(old_c_links)} additional .c hyperlink(s):")
-            for link in old_c_links:
+        if not hyperlinks_aligned:
+            print(f"    [DRY RUN] Would remove {len(old_source)} old source reference link(s):")
+            for link in old_source:
                 print(f"      - {link.get('uri', '?')}")
-        print(f"    [DRY RUN] Would add {len(new_source_links)} new source reference link(s):")
-        for link in new_source_links:
-            print(f"      + {link['uri']}")
-        if ccr_url and ccr_url not in existing_uris:
-            print(f"    [DRY RUN] Would add CCR internal reference:")
-            print(f"      + {ccr_url}")
-        elif ccr_url:
-            print(f"    [DRY RUN] CCR link already exists, skipping")
-        # Component
-        desired_component = f"comp_{component}"
-        if current_component != desired_component:
+            if old_c_links:
+                print(f"    [DRY RUN] Would remove {len(old_c_links)} additional .c hyperlink(s):")
+                for link in old_c_links:
+                    print(f"      - {link.get('uri', '?')}")
+            print(f"    [DRY RUN] Would add {len(new_source_links)} new source reference link(s):")
+            for link in new_source_links:
+                print(f"      + {link['uri']}")
+            if ccr_url and ccr_url not in existing_uris:
+                print(f"    [DRY RUN] Would add CCR internal reference:")
+                print(f"      + {ccr_url}")
+            elif ccr_url:
+                print(f"    [DRY RUN] CCR link already exists, skipping")
+        else:
+            print(f"    ✓ Hyperlinks already aligned")
+        if not component_aligned:
             print(f"    [DRY RUN] Would update fld_component from '{current_component}' to '{desired_component}'")
+        else:
+            print(f"    ✓ Component already aligned")
         # Category
         print(f"    [DRY RUN] Would set fld_category to '{category}'")
-        return True
+        return True, True
 
     # Execute: status -> rework
     if current_status != "rework":
         print(f"    Changing status to 'rework'...")
         if not updater.update_work_item_status(wi_id, "rework", dry_run=False):
             print(f"    ✗ Failed to change status to 'rework', skipping")
-            return False
+            return False, True
         print(f"    ✓ Status changed to 'rework'")
 
-    # Execute: update hyperlinks
-    if updater.update_work_item_hyperlinks(wi_id, updated_hyperlinks, dry_run=False):
-        print(f"    ✓ Hyperlinks updated")
-    else:
-        print(f"    ✗ Failed to update hyperlinks")
-        return False
+    # Execute: update hyperlinks (only if changed)
+    if not hyperlinks_aligned:
+        if updater.update_work_item_hyperlinks(wi_id, updated_hyperlinks, dry_run=False):
+            print(f"    ✓ Hyperlinks updated")
+        else:
+            print(f"    ✗ Failed to update hyperlinks")
+            return False, True
 
-    # Execute: update fld_component
-    desired_component = f"comp_{component}"
-    if current_component != desired_component:
+    # Execute: update fld_component (only if changed)
+    if not component_aligned:
         if updater.update_work_item_attributes(wi_id, {"fld_component": desired_component}, dry_run=False):
             print(f"    ✓ Component updated to '{desired_component}'")
         else:
@@ -821,7 +867,7 @@ def update_existing_work_item(
         print(f"      Response: {cat_resp.text[:500]}")
 
     # Note: status -> in_review is done after TC linking in the main flow
-    return True
+    return True, True
 
 
 def create_new_work_item(
@@ -987,6 +1033,80 @@ def _get_existing_tc_links(
     return tc_links
 
 
+def _resolve_existing_tc_links(
+    updater: PolarionSourceLinkUpdater,
+    tp_wi_id: str,
+    test_name: str,
+    verbose: bool = False,
+) -> Tuple[set, List[Dict], List[Dict], set]:
+    """
+    Classify existing TC links on a TP as same-function or foreign.
+
+    A TC is "same-function" if its title starts with '{test_name}_'.
+    Everything else is foreign (belongs to a different function's TP).
+
+    Returns (same_function_tc_names, same_function_links, foreign_links, foreign_tc_names).
+    """
+    existing = _get_existing_tc_links(updater, tp_wi_id, verbose)
+    if not existing:
+        return set(), [], [], set()
+
+    same_function_names: set = set()
+    same_function_links: List[Dict] = []
+    foreign_links: List[Dict] = []
+    foreign_names: set = set()
+    prefix = f"{test_name}_"
+
+    tp_short = updater._extract_short_id(tp_wi_id)
+    print(f"      Resolving {len(existing)} existing TC link(s) on {tp_short}...")
+
+    for item in existing:
+        link_id = item.get("id", "")
+
+        # Strategy 1: use relationships.workItem.data.id (most reliable)
+        rel_id = (item.get("relationships", {})
+                      .get("workItem", {})
+                      .get("data", {})
+                      .get("id", ""))
+        if rel_id:
+            target_short_id = updater._extract_short_id(rel_id)
+        else:
+            # Strategy 2: parse from link ID — target is second-to-last segment
+            # (format varies but role is always last, target always before it)
+            parts = link_id.split("/")
+            if len(parts) >= 3:
+                target_short_id = parts[-2]
+            else:
+                print(f"        ? Could not parse link ID: {link_id}")
+                foreign_links.append(item)
+                continue
+
+        # Fetch TC title
+        url = f"{updater.base_url}/projects/{updater.project_id}/workitems/{target_short_id}"
+        params = {"fields[workitems]": "title"}
+        resp = updater.session.get(url, params=params, verify=updater.verify_ssl)
+        if resp.status_code != 200:
+            print(f"        ? Could not fetch {target_short_id} (HTTP {resp.status_code}) — treating as foreign")
+            foreign_links.append(item)
+            continue
+
+        title = resp.json().get("data", {}).get("attributes", {}).get("title", "")
+
+        if title.startswith(prefix):
+            same_function_names.add(title)
+            same_function_links.append(item)
+            if verbose:
+                print(f"        ✓ {target_short_id} - {title}")
+        else:
+            foreign_links.append(item)
+            foreign_names.add(title)
+            print(f"        ↳ foreign: {target_short_id} - {title}")
+
+    print(f"      Classified: {len(same_function_links)} same-function, {len(foreign_links)} foreign")
+
+    return same_function_names, same_function_links, foreign_links, foreign_names
+
+
 def _delete_linked_work_item(
     updater: PolarionSourceLinkUpdater,
     tp_wi_id: str,
@@ -1059,33 +1179,62 @@ def link_test_cases_to_tp(
     tc_cache: Dict[str, Optional[str]],
     dry_run: bool = True,
     verbose: bool = False,
-) -> int:
+    _resolved: Optional[Tuple[set, List[Dict], List[Dict], set]] = None,
+) -> Tuple[int, bool]:
     """
     Link test cases found in the tp file to the given TP work item.
-    Returns count of TCs successfully linked.
+    Preserves foreign TC links (those belonging to other functions).
+
+    Returns (count of TCs linked, whether TC links were already aligned).
+    Pass _resolved to reuse a prior _resolve_existing_tc_links() result.
     """
     if not tp_file.tc_names:
-        return 0
+        return 0, True
 
     tp_short = updater._extract_short_id(tp_wi_id)
     print(f"    TC linking for {tp_short}:")
     print(f"      Found {len(tp_file.tc_names)} TC reference(s) in file")
 
+    # Classify existing TC links as same-function or foreign
+    if tp_wi_id == "DRY_RUN":
+        # Newly created WI in dry_run mode — no existing links
+        same_function_names, same_function_links, foreign_links, foreign_names = set(), [], [], set()
+    elif _resolved is not None:
+        same_function_names, same_function_links, foreign_links, foreign_names = _resolved
+    else:
+        same_function_names, same_function_links, foreign_links, foreign_names = _resolve_existing_tc_links(
+            updater, tp_wi_id, tp_file.test_name, verbose
+        )
+
+    desired_names = set(tp_file.tc_names)
+
+    # Check alignment
+    if same_function_names == desired_names:
+        print(f"      ✓ TC links already aligned ({len(desired_names)} of the function"
+              + (f", {len(foreign_links)} foreign preserved" if foreign_links else "")
+              + ")")
+        return 0, True
+
+    # Not aligned — show what differs
+    to_add = desired_names - same_function_names
+    to_remove = same_function_names - desired_names
+    if to_add:
+        print(f"      TC(s) to add:    {sorted(to_add)}")
+    if to_remove:
+        print(f"      TC(s) to remove: {sorted(to_remove)}")
+
     linked_count = 0
 
-    # Remove all existing TC links from TP first (preserves TR links)
+    # Delete only same-function TC links (preserve foreign)
     if not dry_run:
-        existing = _get_existing_tc_links(updater, tp_wi_id, verbose)
-        if existing and verbose:
-            print(f"      Deleting {len(existing)} existing TC link(s) from TP {tp_short}:")
-            for link in existing:
-                link_id = link.get("id", "?")
-                role = link.get("attributes", {}).get("role", "?")
-                print(f"        - {link_id} (role: {role})")
-        for link in existing:
-            _delete_linked_work_item(updater, tp_wi_id, link, verbose)
+        if same_function_links:
+            print(f"      Deleting {len(same_function_links)} of the function TC link(s)...")
+            for link in same_function_links:
+                _delete_linked_work_item(updater, tp_wi_id, link, verbose)
     else:
-        print(f"      [DRY RUN] Would remove existing TC links from TP {tp_short} (preserving TR links)")
+        print(f"      [DRY RUN] Would remove {len(same_function_links)} of the function TC link(s)"
+              + (f", preserve {len(foreign_links)} foreign" if foreign_links else "")
+              + ")")
 
     for tc_name in tp_file.tc_names:
         tc_wi_id = find_tc_work_item(updater, tc_name, tc_cache, verbose)
@@ -1107,7 +1256,7 @@ def link_test_cases_to_tp(
         else:
             print(f"      ✗ Failed to link TP {tp_short} → TC {tc_short} ({tc_name})")
 
-    return linked_count
+    return linked_count, False
 
 
 # ---------------------------------------------------------------------------
@@ -1417,12 +1566,12 @@ Examples:
 
     dry_run = not args.execute
 
-    print("=" * 60)
+    print("=" * 180)
     if dry_run:
         print("DRY RUN MODE - No changes will be made")
     else:
         print("EXECUTE MODE - Changes will be applied!")
-    print("=" * 60)
+    print("=" * 180)
 
     # Phase 0: Resolve branch
     ccr_id = args.ccr_id  # may be None if --branch was used
@@ -1430,15 +1579,16 @@ Examples:
         branch_name = args.branch
         print(f"\nPhase 0: Using branch '{branch_name}' (provided directly)")
     else:
-        print(f"\nPhase 0: Resolving CCR #{ccr_id} branch...")
+        print(f"\nPhase 0: Resolving CCR branch...")
         branch_name = resolve_ccr_branch(ccr_id, verbose=args.verbose)
 
     if use_remote:
         # Remote mode: files are fetched from the CCR/feature branch,
         # but hyperlinks use --gitlab-base as-is (e.g. wassp-jenkins).
         gitlab_base = args.gitlab_base
-        print(f"  Using remote mode (GitLab API) on branch '{branch_name}'")
-        print(f"  Source reference base: {gitlab_base}")
+        if args.verbose:
+            print(f"  [VERBOSE] Using remote mode (GitLab API) on branch '{branch_name}'")
+            print(f"  [VERBOSE] Source reference base: {gitlab_base}")
 
         gitlab_client = GitLabRepoClient(
             args.gitlab_base, gitlab_token,
@@ -1451,7 +1601,6 @@ Examples:
 
     # Phase 1: discover files
     if use_remote:
-        print(f"\nPhase 1: Discovering tp files via GitLab API (branch: {branch_name})")
         tp_files = discover_tp_files_remote(
             gitlab_client, branch_name,
             include_srvc=args.include_srvc, verbose=args.verbose,
@@ -1459,7 +1608,6 @@ Examples:
             component_override=args.component,
         )
     else:
-        print(f"\nPhase 1: Discovering tp files in {repo_path}")
         tp_files = discover_tp_files(
             repo_path, include_srvc=args.include_srvc, verbose=args.verbose,
             component_glob=args.component_glob,
@@ -1469,22 +1617,23 @@ Examples:
         print("No tp files found. Nothing to do.")
         return
 
-    # Print discovery summary
     by_variant: Dict[str, List[TpFileInfo]] = {}
     for f in tp_files:
         by_variant.setdefault(f"{f.boot_app_variant}/{f.test_type}", []).append(f)
 
-    print(f"\nDiscovered {len(tp_files)} tp file(s) across {len(by_variant)} folder(s):")
-    for key in sorted(by_variant.keys()):
-        files = by_variant[key]
-        print(f"  {key}: {len(files)} file(s)")
-        for f in files:
-            tc_count = len(f.tc_names)
-            tc_info = f" [{tc_count} TC(s)]" if tc_count else ""
-            print(f"    - {f.tp_filename} (test: {f.test_name}){tc_info}")
+    print(f"Phase 1: Discovered {len(tp_files)} TP file(s) across {len(by_variant)} folder(s)")
+
+    if args.verbose:
+        for key in sorted(by_variant.keys()):
+            files = by_variant[key]
+            print(f"  {key}: {len(files)} file(s)")
+            for f in files:
+                tc_count = len(f.tc_names)
+                tc_info = f" [{tc_count} TC(s)]" if tc_count else ""
+                print(f"    - {f.tp_filename} (test: {f.test_name}){tc_info}")
 
     # Phase 2: match against Polarion
-    print(f"\nPhase 2: Querying Polarion for existing work items...")
+    print(f"Phase 2: Querying Polarion for existing work items...")
     updater = PolarionSourceLinkUpdater(
         base_url, pat, project_id,
         verify_ssl=args.verify_ssl,
@@ -1492,57 +1641,59 @@ Examples:
     )
     match_result = match_files_to_work_items(tp_files, updater, verbose=args.verbose)
 
-    print(f"\nMatching results:")
-    print(f"  Work items to update: {len(match_result.updates)}")
-    print(f"  Work items to create: {len(match_result.creates)}")
-
-    # --- Change log (grouped by function) ---
-    entries_by_group: Dict[str, List[str]] = {}
+    # --- Resolved Mappings (printed immediately after matching) ---
+    info_by_group: Dict[str, List[str]] = {}
     for wi_id, wi_title, tp_file in match_result.updates:
         short_id = updater._extract_short_id(wi_id)
         tl_url, tp_url = build_gitlab_urls(tp_file, gitlab_base)
-        lines = [f"  [WOULD UPDATE] {short_id} - {wi_title}"]
-        for tc_name in tp_file.tc_names:
-            lines.append(f"      [implements] {tc_name}")
-        lines.append("")
+        lines = [f"  {short_id} - {wi_title}", ""]
+        if tp_file.tc_names:
+            for tc_name in tp_file.tc_names:
+                lines.append(f"      [implements] {tc_name}")
+            lines.append("")
         if tl_url:
             lines.append(f"      [source reference] {tl_url}")
         lines.append(f"      [source reference] {tp_url}")
-        entries_by_group.setdefault(tp_file.group_key, []).append("\n".join(lines))
+        info_by_group.setdefault(tp_file.group_key, []).append("\n".join(lines))
 
     for number, tp_file in match_result.creates:
         title = f"{tp_file.test_name}_{tp_file.test_type}_{number}"
         tl_url, tp_url = build_gitlab_urls(tp_file, gitlab_base)
-        lines = [f"  [WOULD CREATE] {title}"]
-        for tc_name in tp_file.tc_names:
-            lines.append(f"      [implements] {tc_name}")
-        lines.append("")
+        lines = [f"  (new) {title}", ""]
+        if tp_file.tc_names:
+            for tc_name in tp_file.tc_names:
+                lines.append(f"      [implements] {tc_name}")
+            lines.append("")
         if tl_url:
             lines.append(f"      [source reference] {tl_url}")
         lines.append(f"      [source reference] {tp_url}")
-        entries_by_group.setdefault(tp_file.group_key, []).append("\n".join(lines))
+        info_by_group.setdefault(tp_file.group_key, []).append("\n".join(lines))
 
-    if entries_by_group:
-        print(f"\n{'=' * 60}")
-        print("Change Log")
-        print("=" * 60)
-        first_group = True
-        for group_key in sorted(entries_by_group.keys()):
-            if not first_group:
-                print("  " + "-" * 40)
-            first_group = False
-            group_entries = entries_by_group[group_key]
-            for i, entry in enumerate(group_entries):
-                print(entry)
-                if i < len(group_entries) - 1:
-                    print()
+    branch_label = f"CCR #{ccr_id} ({branch_name})" if ccr_id else branch_name
+    print(f"\n{'=' * 180}")
+    print(f"Resolved Mappings from {branch_label}")
+    print("=" * 180)
+    first_group = True
+    for group_key in sorted(info_by_group.keys()):
+        if not first_group:
+            print()
+            print("  " + "-" * 120)
+        first_group = False
+        entries = info_by_group[group_key]
+        for i, entry in enumerate(entries):
+            print()
+            print(entry)
+            if i < len(entries) - 1:
+                print()
 
     # Phase 3: update existing work items
     updated_ok = 0
     updated_fail = 0
+    aligned_count = 0
     items_processed = 0
     tc_linked_total = 0
     tc_cache: Dict[str, Optional[str]] = {}
+    change_entries_by_group: Dict[str, List[str]] = {}
     limit = args.limit
     if match_result.updates and not args.skip_updates:
         print(f"\nPhase 3: Updating existing work items...")
@@ -1550,19 +1701,100 @@ Examples:
             if limit and items_processed >= limit:
                 print(f"  Limit of {limit} reached, stopping.")
                 break
-            if update_existing_work_item(
+
+            short_id = updater._extract_short_id(wi_id)
+
+            # Step 1: Check and apply WI attribute changes
+            result = update_existing_work_item(
                 updater, wi_id, wi_title, tp_file,
                 gitlab_base, ccr_id,
                 component=args.component, category=args.category,
                 dry_run=dry_run, verbose=args.verbose,
-            ):
-                updated_ok += 1
-                # Link TCs to this TP (TP is still in rework)
-                tc_linked_total += link_test_cases_to_tp(
-                    updater, wi_id, tp_file, tc_cache,
-                    dry_run=dry_run, verbose=args.verbose,
+            )
+            success, wi_changes = result[0], result[1]
+
+            if not success:
+                updated_fail += 1
+                items_processed += 1
+                continue
+
+            # Step 2: Pre-resolve TC alignment (avoid double fetch)
+            if tp_file.tc_names and wi_id != "DRY_RUN":
+                resolved = _resolve_existing_tc_links(
+                    updater, wi_id, tp_file.test_name, args.verbose
                 )
-                # Now set TP to in_review
+                same_names = resolved[0]
+                tc_will_change = same_names != set(tp_file.tc_names)
+            else:
+                resolved = None
+                tc_will_change = bool(tp_file.tc_names)
+
+            # Step 3: If only TC links need changes (WI attrs aligned),
+            # ensure rework status before modifying links
+            if tc_will_change and not wi_changes and not dry_run:
+                fetch_url = f"{updater.base_url}/projects/{updater.project_id}/workitems/{short_id}"
+                fetch_resp = updater.session.get(
+                    fetch_url, params={"fields[workitems]": "status"},
+                    verify=updater.verify_ssl,
+                )
+                if fetch_resp.status_code == 200:
+                    cur_st = fetch_resp.json().get("data", {}).get("attributes", {}).get("status", "")
+                    if cur_st != "rework":
+                        print(f"    Setting status to 'rework' for TC link changes...")
+                        updater.update_work_item_status(wi_id, "rework", dry_run=False)
+            elif tc_will_change and not wi_changes and dry_run:
+                print(f"    [DRY RUN] Would change status to 'rework' for TC link changes")
+
+            # Step 4: Apply TC link changes (passing pre-resolved data)
+            tc_count, tc_aligned = link_test_cases_to_tp(
+                updater, wi_id, tp_file, tc_cache,
+                dry_run=dry_run, verbose=args.verbose,
+                _resolved=resolved,
+            )
+            tc_linked_total += tc_count
+
+            # Determine overall alignment
+            fully_aligned = not wi_changes and tc_aligned
+
+            if fully_aligned:
+                aligned_count += 1
+                foreign_count = len(resolved[3]) if resolved and resolved[3] else 0
+                tc_summary = f"{len(tp_file.tc_names)} of the function"
+                if foreign_count:
+                    tc_summary += f", {foreign_count} foreign"
+                lines = [f"  [ALIGNED \u2713] {short_id} - {wi_title}",
+                         f"      TCs already aligned ({tc_summary}) \u2713"]
+                change_entries_by_group.setdefault(tp_file.group_key, []).append("\n".join(lines))
+            else:
+                updated_ok += 1
+                tl_url, tp_url = build_gitlab_urls(tp_file, gitlab_base)
+                tag = "[WOULD UPDATE]" if dry_run else "[UPDATED]"
+                lines = [f"  {tag} {short_id} - {wi_title}"]
+                if tc_aligned and tp_file.tc_names:
+                    foreign_count = len(resolved[3]) if resolved and resolved[3] else 0
+                    tc_summary = f"{len(tp_file.tc_names)} of the function"
+                    if foreign_count:
+                        tc_summary += f", {foreign_count} foreign"
+                    lines.append(f"      TCs already aligned ({tc_summary}) \u2713")
+                else:
+                    same_names = resolved[0] if resolved else set()
+                    for tc_name in tp_file.tc_names:
+                        if tc_name in same_names:
+                            lines.append(f"      [implements] {tc_name} \u2713")
+                        elif tc_cache.get(tc_name) is None:
+                            lines.append(f"      [implements] {tc_name}  \u26a0 Work Item not found in Polarion - check TC name in TP file or Polarion")
+                        else:
+                            lines.append(f"      [implements] {tc_name}  [+] Currently missing - will be added")
+                    if resolved and resolved[3]:
+                        for tc_name in sorted(resolved[3]):
+                            lines.append(f"      [implements] {tc_name}  (foreign) \u2713")
+                lines.append("")
+                if tl_url:
+                    lines.append(f"      [source reference] {tl_url}")
+                lines.append(f"      [source reference] {tp_url}")
+                change_entries_by_group.setdefault(tp_file.group_key, []).append("\n".join(lines))
+
+                # Status → in_review (only when changes were/would be made)
                 if not dry_run:
                     print(f"    Changing TP status to 'in_review'...")
                     if updater.update_work_item_status(wi_id, "in_review", dry_run=False):
@@ -1571,8 +1803,7 @@ Examples:
                         print(f"    ⚠ Failed to change TP status to 'in_review'")
                 else:
                     print(f"    [DRY RUN] Would change TP status to 'in_review'")
-            else:
-                updated_fail += 1
+
             items_processed += 1
 
     # Phase 4: create new work items
@@ -1594,10 +1825,11 @@ Examples:
             if created_id:
                 created_ok += 1
                 # Link TCs to this TP (TP is still in rework)
-                tc_linked_total += link_test_cases_to_tp(
+                tc_count, tc_aligned = link_test_cases_to_tp(
                     updater, created_id, tp_file, tc_cache,
                     dry_run=dry_run, verbose=args.verbose,
                 )
+                tc_linked_total += tc_count
                 # Now set TP to in_review
                 if not dry_run and created_id != "DRY_RUN":
                     print(f"    Changing TP status to 'in_review'...")
@@ -1607,26 +1839,57 @@ Examples:
                         print(f"    ⚠ Failed to change TP status to 'in_review'")
                 elif dry_run:
                     print(f"    [DRY RUN] Would change TP status to 'in_review'")
+
+                # Accumulate change log entry
+                title = f"{tp_file.test_name}_{tp_file.test_type}_{number}"
+                tl_url, tp_url = build_gitlab_urls(tp_file, gitlab_base)
+                tag = "[WOULD CREATE]" if dry_run else "[CREATED]"
+                lines = [f"  {tag} {title}"]
+                for tc_name in tp_file.tc_names:
+                    lines.append(f"      [implements] {tc_name}")
+                lines.append("")
+                if tl_url:
+                    lines.append(f"      [source reference] {tl_url}")
+                lines.append(f"      [source reference] {tp_url}")
+                change_entries_by_group.setdefault(tp_file.group_key, []).append("\n".join(lines))
             else:
                 created_fail += 1
             items_processed += 1
 
+    # --- Change Log (after all processing, with alignment info) ---
+    if change_entries_by_group:
+        print(f"\n{'=' * 180}")
+        print("Change Log")
+        print("=" * 180)
+        first_group = True
+        for group_key in sorted(change_entries_by_group.keys()):
+            if not first_group:
+                print("  " + "-" * 120)
+            first_group = False
+            group_entries = change_entries_by_group[group_key]
+            for i, entry in enumerate(group_entries):
+                print(entry)
+                if i < len(group_entries) - 1:
+                    print()
+
     # Summary
-    print(f"\n{'=' * 60}")
+    print(f"\n{'=' * 180}")
     print("Summary:")
     print(f"  Files discovered: {len(tp_files)}")
     print(f"  Existing WIs matched: {len(match_result.updates)}")
     if dry_run:
+        print(f"    Already aligned: {aligned_count}")
         print(f"    Would update: {updated_ok}")
         print(f"  New WIs to create: {len(match_result.creates)}")
         print(f"    Would create: {created_ok}")
         print(f"  TC links: {tc_linked_total}")
         print(f"\nThis was a DRY RUN. Use --execute to apply changes.")
     else:
+        print(f"    Already aligned: {aligned_count}")
         print(f"    Updated OK: {updated_ok}, Failed: {updated_fail}")
         print(f"  New WIs created: {created_ok}, Failed: {created_fail}")
         print(f"  TC links created: {tc_linked_total}")
-    print(f"{'=' * 60}")
+    print(f"{'=' * 180}")
 
 if __name__ == "__main__":
     main()
