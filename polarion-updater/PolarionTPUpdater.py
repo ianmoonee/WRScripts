@@ -2,31 +2,39 @@
 """
 Polarion Test Procedure Work Item Manager
 
-Scans a local git repo for tp_*.c files in SBL_BOOT_APP0* folders' HLTP/LLTP
-directories, matches them against existing Polarion test procedure work items
-by title pattern, updates existing items' hyperlinks, and creates new work items
-for unmatched files.
+Scans a git repo for tp_*.c files in component folders' HLTP/LLTP directories,
+matches them against existing Polarion test procedure work items by title pattern,
+updates existing items' hyperlinks, and creates new work items for unmatched files.
+
+Supports two modes:
+  - Local mode (--repo-path): checks out the CCR branch locally and scans the filesystem.
+  - Remote mode (no --repo-path): browses the CCR branch via GitLab API (requires GITLAB_TOKEN).
 
 Environment Variables Required:
 - POLARION_API_BASE: Base URL for Polarion API
 - POLARION_PAT: Personal Access Token for authentication
 - POLARION_PROJECT_ID: Project ID in Polarion (can also be provided via --project-id)
-- CCN_LOGIN: CodeCollaborator username (required when --ccr-id is provided)
-- CCN_PASSWORD: CodeCollaborator password (required when --ccr-id is provided)
+- CCN_LOGIN: CodeCollaborator username
+- CCN_PASSWORD: CodeCollaborator password
+- GITLAB_TOKEN: GitLab personal access token (required for remote mode)
 
 Usage:
-    python polarionTestProcedureManager.py --repo-path /path/to/wassp --ccr-id 28264 [--dry-run|--execute]
+    python PolarionTPUpdater.py --ccr-id 28264 --component SSD_NVME0 [--dry-run|--execute]
+    python PolarionTPUpdater.py --branch my-feature-branch --component SSD_NVME0
+    python PolarionTPUpdater.py --repo-path /path/to/wassp --ccr-id 28264 --component SSD_NVME0
 """
 
 import os
 import sys
 import argparse
+import fnmatch
 import glob
 import re
 import json
 import subprocess
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Any
+from urllib.parse import quote as url_quote, urlparse
 
 import requests
 import urllib3
@@ -114,16 +122,83 @@ class PolarionSourceLinkUpdater:
         cleaned = [{'role': l['role'], 'uri': l['uri']} for l in updated_hyperlinks]
         return self.update_work_item_attributes(work_item_id, {'hyperlinks': cleaned}, dry_run=dry_run)
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+# Path to the test directory relative to the repo root.
+# OS-native separators (used for local filesystem operations).
 RELATIVE_TEST_BASE = os.path.join(
     "helix", "guests", "vxworks-7", "pkgs_v2", "test",
     "shallowford-cert-tests"
 )
+# Same path with forward slashes (used for GitLab API calls and URLs).
+RELATIVE_TEST_BASE_POSIX = "helix/guests/vxworks-7/pkgs_v2/test/shallowford-cert-tests"
 
 DEFAULT_GITLAB_BASE = (
     "https://ccn-gitlab.wrs.com/shallowford/project/wassp/-/blob/wassp-jenkins-nth"
 )
 
+# NOTE: hostname is "codeocolab" here vs "codecolab" in CCN_API_BASE — verify this is correct.
 CCR_URL_TEMPLATE = "https://ccn-codeocolab.wrs.com:8443/ui#reviewid={ccr_id}"
+
+
+class GitLabRepoClient:
+    """GitLab API client for browsing repository contents remotely."""
+
+    def __init__(self, gitlab_base_url: str, token: str, verify_ssl: bool = False):
+        # Parse host and project from a gitlab blob URL like:
+        # https://ccn-gitlab.wrs.com/shallowford/project/wassp/-/blob/branch
+        self.verify_ssl = verify_ssl
+        parts = gitlab_base_url.split("/-/")
+        if len(parts) < 2:
+            print(f"Error: Cannot parse GitLab URL: {gitlab_base_url}")
+            sys.exit(1)
+        repo_url = parts[0]  # https://ccn-gitlab.wrs.com/shallowford/project/wassp
+        parsed = urlparse(repo_url)
+        self.host = f"{parsed.scheme}://{parsed.netloc}"
+        self.project_path = parsed.path.strip("/")
+        self.project_id = url_quote(self.project_path, safe="")
+        self.api_base = f"{self.host}/api/v4"
+        self.session = requests.Session()
+        self.session.headers.update({"PRIVATE-TOKEN": token})
+        self.session.verify = verify_ssl
+
+    def list_tree(self, path: str, ref: str) -> List[Dict]:
+        """List directory contents at path on the given ref/branch."""
+        url = f"{self.api_base}/projects/{self.project_id}/repository/tree"
+        params = {"path": path, "ref": ref, "per_page": 100}
+        all_items: List[Dict] = []
+        page = 1
+        while True:
+            params["page"] = page
+            resp = self.session.get(url, params=params, verify=self.verify_ssl)
+            if resp.status_code != 200:
+                if page == 1:
+                    # Directory doesn't exist or error
+                    return []
+                break
+            items = resp.json()
+            if not items:
+                break
+            all_items.extend(items)
+            page += 1
+        return all_items
+
+    def get_file_content(self, file_path: str, ref: str) -> Optional[str]:
+        """Get raw file content from the repo."""
+        encoded_path = url_quote(file_path, safe="")
+        url = f"{self.api_base}/projects/{self.project_id}/repository/files/{encoded_path}/raw"
+        params = {"ref": ref}
+        resp = self.session.get(url, params=params, verify=self.verify_ssl)
+        if resp.status_code == 200:
+            return resp.text
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Data Classes
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -177,10 +252,43 @@ class MatchResult:
 # Phase 1: File Discovery
 # ---------------------------------------------------------------------------
 
-# Regex to match __TP_DESC_FLAGS__(Subtest_N, tcName, ...)
+# Regex to extract the TC name (second argument) from __TP_DESC_FLAGS__(Subtest_N, tcName, ...)
 _TP_DESC_FLAGS_PATTERN = re.compile(
     r'__TP_DESC_FLAGS__\s*\(\s*\w+\s*,\s*(\w+)',
 )
+
+
+def parse_tc_names_from_content(content: str, include_srvc: bool = False) -> List[str]:
+    """
+    Extract test case names from __TP_DESC_FLAGS__ entries within testCases_Init
+    arrays (and optionally testCases_Srvc arrays) in a tp .c file's content.
+    """
+    target_arrays = {'testCases_Init'}
+    if include_srvc:
+        target_arrays.add('testCases_Srvc')
+
+    tc_names = []
+    seen = set()
+    in_target_array = False
+    for line in content.splitlines():
+        stripped = line.strip()
+        if any(arr in line for arr in target_arrays) and '=' in line:
+            in_target_array = True
+            continue
+        if in_target_array and re.search(r'LOCAL\s+TEST_CASE\s+\w+', line):
+            in_target_array = False
+            continue
+        if in_target_array and stripped.startswith('};'):
+            in_target_array = False
+            continue
+        if in_target_array:
+            m = _TP_DESC_FLAGS_PATTERN.search(line)
+            if m:
+                tc_name = m.group(1)
+                if tc_name not in seen:
+                    seen.add(tc_name)
+                    tc_names.append(tc_name)
+    return tc_names
 
 
 def parse_tc_names_from_file(tp_path: str, include_srvc: bool = False, verbose: bool = False) -> List[str]:
@@ -192,48 +300,47 @@ def parse_tc_names_from_file(tp_path: str, include_srvc: bool = False, verbose: 
     };
     The TC name is the second argument.
     """
-    target_arrays = {'testCases_Init'}
-    if include_srvc:
-        target_arrays.add('testCases_Srvc')
-
-    tc_names = []
-    seen = set()
-    in_target_array = False
     try:
         with open(tp_path, 'r', encoding='utf-8', errors='replace') as f:
-            for line in f:
-                stripped = line.strip()
-                # Detect start of a target array
-                if any(arr in line for arr in target_arrays) and '=' in line:
-                    in_target_array = True
-                    continue
-                # Detect start of any other TEST_CASE array (stop capturing)
-                if in_target_array and re.search(r'LOCAL\s+TEST_CASE\s+\w+', line):
-                    in_target_array = False
-                    continue
-                # Detect end of array
-                if in_target_array and stripped.startswith('};'):
-                    in_target_array = False
-                    continue
-                # Only parse __TP_DESC_FLAGS__ inside target arrays
-                if in_target_array:
-                    m = _TP_DESC_FLAGS_PATTERN.search(line)
-                    if m:
-                        tc_name = m.group(1)
-                        if tc_name not in seen:
-                            seen.add(tc_name)
-                            tc_names.append(tc_name)
+            content = f.read()
     except OSError as e:
         if verbose:
             print(f"  [VERBOSE] Could not read {tp_path}: {e}")
-    return tc_names
+        return []
+    return parse_tc_names_from_content(content, include_srvc)
+
+
+def _extract_test_name(
+    tp_basename: str, variant: str, subdir_name: Optional[str]
+) -> Optional[str]:
+    """
+    Extract the test name from a tp_*.c filename.
+
+    Handles two naming conventions:
+      - tp_{variant}_{testName}.c  (standard)
+      - tp_{subdir}_{testName}.c   (inside LLTP subdirectories)
+
+    Returns the test name string, or None if the filename is unrecognized.
+    """
+    prefix = f"tp_{variant}_"
+    subdir_prefix = f"tp_{subdir_name}_" if subdir_name else None
+    if tp_basename.startswith(prefix) and tp_basename.endswith(".c"):
+        test_name = tp_basename[len(prefix):-2]
+    elif subdir_prefix and tp_basename.startswith(subdir_prefix) and tp_basename.endswith(".c"):
+        test_name = tp_basename[len(subdir_prefix):-2]
+    else:
+        return None
+    # Strip subdirectory name prefix (e.g. bootElfLib_bootElfModule -> bootElfModule)
+    if subdir_name and test_name.startswith(f"{subdir_name}_"):
+        test_name = test_name[len(subdir_name) + 1:]
+    return test_name
 
 
 def discover_tp_files(repo_path: str, include_srvc: bool = False, verbose: bool = False,
                       component_glob: str = "SBL_BOOT_APP0*",
                       component_override: Optional[str] = None) -> List[TpFileInfo]:
     """
-    Scan the repo for tp_*.c files in <component_glob>/HLTP and <component_glob>/LLTP.
+    Scan the local repo for tp_*.c files in <component_glob>/HLTP and <component_glob>/LLTP.
     """
     # If component_glob starts with POSBSP, look under SFORD_POS; otherwise under native
     subdir = "SFORD_POS" if component_glob.startswith("POSBSP") else "native"
@@ -312,23 +419,11 @@ def discover_tp_files(repo_path: str, include_srvc: bool = False, verbose: bool 
 
                 for tp_path in tp_files_found:
                     tp_basename = os.path.basename(tp_path)
-                    # Extract test name: strip tp_{variant}_ or tp_{subdir}_ prefix and .c suffix
-                    prefix = f"tp_{variant}_"
-                    subdir_prefix = f"tp_{subdir_name}_" if subdir_name else None
-                    if tp_basename.startswith(prefix) and tp_basename.endswith(".c"):
-                        test_name = tp_basename[len(prefix):-2]
-                    elif subdir_prefix and tp_basename.startswith(subdir_prefix) and tp_basename.endswith(".c"):
-                        test_name = tp_basename[len(subdir_prefix):-2]
-                    else:
+                    test_name = _extract_test_name(tp_basename, variant, subdir_name)
+                    if test_name is None:
                         if verbose:
                             print(f"  [VERBOSE] Skipping file with unexpected name: {tp_basename}")
                         continue
-
-                    # For files in subdirectories (e.g., LLTP/bootElfLib/), strip the
-                    # subdirectory name prefix from the test name:
-                    # bootElfLib_bootElfModule -> bootElfModule
-                    if subdir_name and test_name.startswith(f"{subdir_name}_"):
-                        test_name = test_name[len(subdir_name) + 1:]
 
                     # Build relative dir path (forward slashes for GitLab URLs)
                     rel_dir = os.path.relpath(search_dir, repo_path).replace("\\", "/")
@@ -351,6 +446,123 @@ def discover_tp_files(repo_path: str, include_srvc: bool = False, verbose: bool 
 
                     if verbose:
                         print(f"  [VERBOSE] Found: {variant}/{test_type}/{os.path.relpath(tp_path, type_dir).replace(os.sep, '/')} -> test={test_name}")
+
+    return results
+
+
+def discover_tp_files_remote(
+    gitlab_client: GitLabRepoClient,
+    ref: str,
+    include_srvc: bool = False,
+    verbose: bool = False,
+    component_glob: str = "SBL_BOOT_APP0*",
+    component_override: Optional[str] = None,
+) -> List[TpFileInfo]:
+    """
+    Discover tp_*.c files by browsing the GitLab repository via API.
+    Same logic as discover_tp_files() but uses GitLab API instead of local filesystem.
+    """
+    subdir = "SFORD_POS" if component_glob.startswith("POSBSP") else "native"
+    base_path = f"{RELATIVE_TEST_BASE_POSIX}/{subdir}"
+
+    # List component directories matching the glob
+    entries = gitlab_client.list_tree(base_path, ref)
+    dirs = [e for e in entries if e.get("type") == "tree"]
+    matching_dirs = [d for d in dirs if fnmatch.fnmatch(d["name"], component_glob)]
+
+    if not matching_dirs:
+        print(f"Warning: No directories matching '{component_glob}' found in {base_path} on ref '{ref}'")
+        return []
+
+    results: List[TpFileInfo] = []
+
+    for variant_entry in sorted(matching_dirs, key=lambda d: d["name"]):
+        variant = variant_entry["name"]
+
+        for test_type in ("HLTP", "LLTP"):
+            type_path = f"{base_path}/{variant}/{test_type}"
+            type_entries = gitlab_client.list_tree(type_path, ref)
+            if not type_entries:
+                if verbose:
+                    print(f"  [VERBOSE] No {test_type} directory in {variant}")
+                continue
+
+            # Collect search dirs: the type_path itself + any subdirectories
+            sub_dirs_to_search = [(type_path, None)]  # (path, subdir_name)
+            for entry in type_entries:
+                if entry.get("type") == "tree":
+                    sub_dirs_to_search.append((f"{type_path}/{entry['name']}", entry["name"]))
+
+            for search_path, subdir_name in sub_dirs_to_search:
+                if subdir_name:
+                    dir_entries = gitlab_client.list_tree(search_path, ref)
+                else:
+                    dir_entries = type_entries
+
+                file_names = sorted(
+                    e["name"] for e in dir_entries if e.get("type") == "blob"
+                )
+
+                # Find tl file
+                tl_filename = None
+                if subdir_name:
+                    tl_cand = f"tl_{variant}_{subdir_name}.c"
+                    if tl_cand in file_names:
+                        tl_filename = tl_cand
+                if not tl_filename:
+                    tl_cand = f"tl_{variant}.c"
+                    if tl_cand in file_names:
+                        tl_filename = tl_cand
+                if not tl_filename:
+                    tl_any = [f for f in file_names if f.startswith("tl_") and f.endswith(".c")]
+                    if tl_any:
+                        tl_filename = tl_any[0]
+
+                # Find tp files matching variant pattern
+                tp_prefix = f"tp_{variant}_"
+                tp_files_found = sorted(
+                    f for f in file_names
+                    if f.startswith(tp_prefix) and f.endswith(".c")
+                )
+
+                # In subdirectories, also match tp_{subdir}_*.c
+                if subdir_name:
+                    sub_prefix = f"tp_{subdir_name}_"
+                    for f in sorted(file_names):
+                        if f.startswith(sub_prefix) and f.endswith(".c") and f not in tp_files_found:
+                            tp_files_found.append(f)
+                    tp_files_found.sort()
+
+                for tp_basename in tp_files_found:
+                    test_name = _extract_test_name(tp_basename, variant, subdir_name)
+                    if test_name is None:
+                        if verbose:
+                            print(f"  [VERBOSE] Skipping file with unexpected name: {tp_basename}")
+                        continue
+
+                    rel_dir = search_path  # already forward-slash POSIX path
+
+                    # Fetch file content from GitLab and parse TC names
+                    tp_file_path = f"{search_path}/{tp_basename}"
+                    content = gitlab_client.get_file_content(tp_file_path, ref)
+                    tc_names = parse_tc_names_from_content(content, include_srvc) if content else []
+
+                    info = TpFileInfo(
+                        tp_filename=tp_basename,
+                        tl_filename=tl_filename,
+                        boot_app_variant=variant,
+                        test_type=test_type,
+                        test_name=test_name,
+                        dir_path=search_path,
+                        rel_dir=rel_dir,
+                        tc_names=tc_names,
+                        component_override=component_override,
+                    )
+                    results.append(info)
+
+                    if verbose:
+                        display = tp_basename if not subdir_name else f"{subdir_name}/{tp_basename}"
+                        print(f"  [VERBOSE] Found: {variant}/{test_type}/{display} -> test={test_name}")
 
     return results
 
@@ -464,6 +676,7 @@ def build_gitlab_urls(
 
 
 def build_ccr_url(ccr_id: str) -> str:
+    """Build the CodeCollaborator review URL for the given CCR ID."""
     return CCR_URL_TEMPLATE.format(ccr_id=ccr_id)
 
 
@@ -871,7 +1084,7 @@ def link_test_cases_to_tp(
                 print(f"        - {link_id} (role: {role})")
         for link in existing:
             _delete_linked_work_item(updater, tp_wi_id, link, verbose)
-    elif dry_run:
+    else:
         print(f"      [DRY RUN] Would remove existing TC links from TP {tp_short} (preserving TR links)")
 
     for tc_name in tp_file.tc_names:
@@ -901,6 +1114,7 @@ def link_test_cases_to_tp(
 # CCR Branch Resolution & Git Checkout
 # ---------------------------------------------------------------------------
 
+# CodeCollaborator JSON API endpoint (used for CCR branch resolution)
 CCN_API_BASE = "https://ccn-codecolab.wrs.com:8443/services/json/v1"
 
 
@@ -1056,21 +1270,25 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s --repo-path /path/to/wassp --ccr-id 28264 --dry-run
-  %(prog)s --repo-path /path/to/wassp --ccr-id 28264 --execute --limit 1
-  %(prog)s --repo-path /path/to/wassp --ccr-id 28264 --project-id Shallowford_BL
+  %(prog)s --ccr-id 28264 --component SSD_NVME0 --dry-run
+  %(prog)s --ccr-id 28264 --component SSD_NVME0 --execute --limit 1
+  %(prog)s --branch my-feature-branch --component SSD_NVME0
+  %(prog)s --repo-path /path/to/wassp --ccr-id 28264 --component SSD_NVME0
         """,
     )
 
     parser.add_argument(
         "--repo-path",
-        required=True,
-        help="Path to the local git repo root (wassp)",
+        default=None,
+        help="Path to the local git repo root (wassp). If omitted, files are browsed via GitLab API (requires GITLAB_TOKEN).",
     )
     parser.add_argument(
         "--ccr-id",
-        required=True,
-        help="CCR review ID for internal reference hyperlinks and branch checkout",
+        help="CCR review ID — resolves the branch automatically and adds CCR hyperlink",
+    )
+    parser.add_argument(
+        "--branch",
+        help="Git branch name to use directly (skips CCR resolution, no CCR hyperlink added)",
     )
     parser.add_argument(
         "--gitlab-base",
@@ -1148,28 +1366,54 @@ Examples:
 
     args = parser.parse_args()
 
-    # Validate repo path
-    repo_path = os.path.abspath(args.repo_path)
-    if not os.path.isdir(repo_path):
-        print(f"Error: repo path does not exist: {repo_path}")
-        sys.exit(1)
+    if args.ccr_id and args.branch:
+        parser.error("The branch must be either provided directly (--branch) or resolved from a CCR ID (--ccr-id), not both.")
+    if not args.ccr_id and not args.branch:
+        parser.error("Either --ccr-id or --branch must be provided.")
+
+    # Determine mode: local (--repo-path) or remote (GitLab API)
+    use_remote = args.repo_path is None
+    repo_path = None
+    if not use_remote:
+        repo_path = os.path.abspath(args.repo_path)
+        if not os.path.isdir(repo_path):
+            print(f"Error: repo path does not exist: {repo_path}")
+            sys.exit(1)
 
     # Environment variables
     base_url = os.environ.get("POLARION_API_BASE")
     pat = os.environ.get("POLARION_PAT")
     project_id = args.project_id or os.environ.get("POLARION_PROJECT_ID")
+    gitlab_token = os.environ.get("GITLAB_TOKEN")
 
     missing = []
     if not base_url:
-        missing.append("POLARION_API_BASE")
+        missing.append(("POLARION_API_BASE", "Polarion REST API base URL (e.g. https://ccn-polarion.wrs.com/polarion/rest/v1)"))
     if not pat:
-        missing.append("POLARION_PAT")
+        missing.append(("POLARION_PAT", "Polarion personal access token — generate one from your Polarion profile"))
     if not project_id:
-        missing.append("POLARION_PROJECT_ID (or use --project-id)")
+        missing.append(("POLARION_PROJECT_ID", 'Polarion project ID (e.g. "Shallowford_BSP" or "Shallowford_BL"). Can also be passed via --project-id'))
+    if use_remote and not gitlab_token:
+        missing.append(("GITLAB_TOKEN", "GitLab personal access token (read_api + read_repository scopes) — generate one from your GitLab profile. Required in remote mode (when --repo-path is not provided)"))
+    if args.ccr_id:
+        if not os.environ.get("CCN_LOGIN"):
+            missing.append(("CCN_LOGIN", "CodeCollaborator username — required when using --ccr-id"))
+        if not os.environ.get("CCN_PASSWORD"):
+            missing.append(("CCN_PASSWORD", "CodeCollaborator password — required when using --ccr-id"))
+
     if missing:
-        print("Error: Missing required environment variables:")
-        for var in missing:
-            print(f"  - {var}")
+        print("Error: The following environment variables are missing:\n")
+        for var, desc in missing:
+            print(f"  {var}")
+            print(f"    {desc}\n")
+        print("Make sure your ~/.bashrc (or equivalent) contains the following:\n")
+        print('  export POLARION_API_BASE="https://ccn-polarion.wrs.com/polarion/rest/v1"')
+        print('  export POLARION_PAT="<your personal access token — see your Polarion profile>"')
+        print('  export POLARION_PROJECT_ID="e.g.: Shallowford_BSP or Shallowford_BL"')
+        print('  export CCN_LOGIN="<your CodeCollaborator username>"')
+        print('  export CCN_PASSWORD="<your CodeCollaborator password>"')
+        print('  export GITLAB_TOKEN="<your personal access token — see your GitLab profile>"\n')
+        print("Don't forget to run  \"source ~/.bashrc\" after updating your environment variables. :p")
         sys.exit(1)
 
     dry_run = not args.execute
@@ -1181,17 +1425,49 @@ Examples:
         print("EXECUTE MODE - Changes will be applied!")
     print("=" * 60)
 
-    # Phase 0: Resolve CCR branch and checkout
-    if args.ccr_id:
-        print(f"\nPhase 0: Resolving CCR #{args.ccr_id} branch and checking out...")
-        branch_name = resolve_ccr_branch(args.ccr_id, verbose=args.verbose)
+    # Phase 0: Resolve branch
+    ccr_id = args.ccr_id  # may be None if --branch was used
+    if args.branch:
+        branch_name = args.branch
+        print(f"\nPhase 0: Using branch '{branch_name}' (provided directly)")
+    else:
+        print(f"\nPhase 0: Resolving CCR #{ccr_id} branch...")
+        branch_name = resolve_ccr_branch(ccr_id, verbose=args.verbose)
+
+    if use_remote:
+        # Remote mode: build gitlab_base URL with the resolved branch
+        # Parse host+project from the default/provided gitlab-base
+        parts = args.gitlab_base.split("/-/")
+        gitlab_repo_url = parts[0] if len(parts) >= 2 else args.gitlab_base
+        gitlab_base = f"{gitlab_repo_url}/-/blob/{branch_name}"
+        print(f"  Using remote mode (GitLab API) on branch '{branch_name}'")
+        print(f"  Source reference base: {gitlab_base}")
+
+        gitlab_client = GitLabRepoClient(
+            args.gitlab_base, gitlab_token,
+            verify_ssl=args.verify_ssl,
+        )
+    else:
+        # Local mode: checkout the branch
+        gitlab_base = args.gitlab_base
         checkout_wassp_branch(repo_path, branch_name, verbose=args.verbose)
 
     # Phase 1: discover files
-    print(f"\nPhase 1: Discovering tp files in {repo_path}")
-    tp_files = discover_tp_files(repo_path, include_srvc=args.include_srvc, verbose=args.verbose,
-                                 component_glob=args.component_glob,
-                                 component_override=args.component)
+    if use_remote:
+        print(f"\nPhase 1: Discovering tp files via GitLab API (branch: {branch_name})")
+        tp_files = discover_tp_files_remote(
+            gitlab_client, branch_name,
+            include_srvc=args.include_srvc, verbose=args.verbose,
+            component_glob=args.component_glob,
+            component_override=args.component,
+        )
+    else:
+        print(f"\nPhase 1: Discovering tp files in {repo_path}")
+        tp_files = discover_tp_files(
+            repo_path, include_srvc=args.include_srvc, verbose=args.verbose,
+            component_glob=args.component_glob,
+            component_override=args.component,
+        )
     if not tp_files:
         print("No tp files found. Nothing to do.")
         return
@@ -1227,7 +1503,7 @@ Examples:
     entries_by_group: Dict[str, List[str]] = {}
     for wi_id, wi_title, tp_file in match_result.updates:
         short_id = updater._extract_short_id(wi_id)
-        tl_url, tp_url = build_gitlab_urls(tp_file, args.gitlab_base)
+        tl_url, tp_url = build_gitlab_urls(tp_file, gitlab_base)
         lines = [f"  [WOULD UPDATE] {short_id} - {wi_title}"]
         for tc_name in tp_file.tc_names:
             lines.append(f"      [implements] {tc_name}")
@@ -1239,7 +1515,7 @@ Examples:
 
     for number, tp_file in match_result.creates:
         title = f"{tp_file.test_name}_{tp_file.test_type}_{number}"
-        tl_url, tp_url = build_gitlab_urls(tp_file, args.gitlab_base)
+        tl_url, tp_url = build_gitlab_urls(tp_file, gitlab_base)
         lines = [f"  [WOULD CREATE] {title}"]
         for tc_name in tp_file.tc_names:
             lines.append(f"      [implements] {tc_name}")
@@ -1250,7 +1526,9 @@ Examples:
         entries_by_group.setdefault(tp_file.group_key, []).append("\n".join(lines))
 
     if entries_by_group:
-        print(f"\nChange log:")
+        print(f"\n{'=' * 60}")
+        print("Change Log")
+        print("=" * 60)
         first_group = True
         for group_key in sorted(entries_by_group.keys()):
             if not first_group:
@@ -1277,7 +1555,7 @@ Examples:
                 break
             if update_existing_work_item(
                 updater, wi_id, wi_title, tp_file,
-                args.gitlab_base, args.ccr_id,
+                gitlab_base, ccr_id,
                 component=args.component, category=args.category,
                 dry_run=dry_run, verbose=args.verbose,
             ):
@@ -1311,7 +1589,7 @@ Examples:
                 break
             created_id = create_new_work_item(
                 updater, number, tp_file,
-                args.gitlab_base, args.ccr_id,
+                gitlab_base, ccr_id,
                 component=args.component, category=args.category,
                 author=args.author,
                 dry_run=dry_run, verbose=args.verbose,
@@ -1352,7 +1630,6 @@ Examples:
         print(f"  New WIs created: {created_ok}, Failed: {created_fail}")
         print(f"  TC links created: {tc_linked_total}")
     print(f"{'=' * 60}")
-
 
 if __name__ == "__main__":
     main()
