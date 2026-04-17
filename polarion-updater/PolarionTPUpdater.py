@@ -8,7 +8,7 @@ updates existing items' hyperlinks, and creates new work items for unmatched fil
 
 Supports two modes:
   - Local mode (--repo-path): checks out the CCR branch locally and scans the filesystem.
-  - Remote mode (no --repo-path): browses the CCR branch via GitLab API (requires GITLAB_TOKEN).
+  - Remote mode (no --repo-path): browses the branch via GitLab API (requires GITLAB_TOKEN). Branch is resolved from --ccr-id or provided directly with --branch.
 
 Environment Variables Required:
 - POLARION_API_BASE: Base URL for Polarion API
@@ -141,8 +141,7 @@ DEFAULT_GITLAB_BASE = (
     "https://ccn-gitlab.wrs.com/shallowford/project/wassp/-/blob/wassp-jenkins-nth"
 )
 
-# NOTE: hostname is "codeocolab" here vs "codecolab" in CCN_API_BASE — verify this is correct.
-CCR_URL_TEMPLATE = "https://ccn-codeocolab.wrs.com:8443/ui#reviewid={ccr_id}"
+CCR_URL_TEMPLATE = "https://ccn-codecolab.wrs.com:8443/ui#review:id={ccr_id}"
 
 
 class GitLabRepoClient:
@@ -206,9 +205,9 @@ class GitLabRepoClient:
 @dataclass
 class TpFileInfo:
     """Represents a discovered tp_*.c file and its context."""
-    tp_filename: str          # e.g. tp_SBL_BOOT_APP0_applyWriteProtect.c
-    tl_filename: Optional[str]  # e.g. tl_SBL_BOOT_APP0.c (may be None if missing)
-    boot_app_variant: str     # e.g. SBL_BOOT_APP0
+    tp_filename: str          # e.g. tp_POSBSP_SSD_NVME0_nvmeInit.c
+    tl_filename: Optional[str]  # e.g. tl_POSBSP_SSD_NVME0.c (may be None if missing)
+    variant: str              # e.g. POSBSP_SSD_NVME0 or SBL_BOOT_APP0
     test_type: str            # HLTP or LLTP
     test_name: str            # e.g. applyWriteProtect
     dir_path: str             # absolute path to the HLTP/LLTP directory
@@ -225,9 +224,9 @@ class TpFileInfo:
         """Derive Polarion component from variant (strip SBL_ prefix), or use override."""
         if self.component_override:
             return self.component_override
-        if self.boot_app_variant.startswith("SBL_"):
-            return self.boot_app_variant[4:]
-        return self.boot_app_variant
+        if self.variant.startswith("SBL_"):
+            return self.variant[4:]
+        return self.variant
 
     @property
     def group_key(self) -> str:
@@ -236,9 +235,9 @@ class TpFileInfo:
 
     @property
     def sort_key(self) -> Tuple[int, str]:
-        """Sort key: base variant (SBL_BOOT_APP0) first, then alphabetical."""
-        is_base = 0 if self.boot_app_variant == "SBL_BOOT_APP0" else 1
-        return (is_base, self.boot_app_variant)
+        """Sort key: base variant first, then alphabetical."""
+        is_base = 0 if self.variant == "SBL_BOOT_APP0" else 1
+        return (is_base, self.variant)
 
 
 @dataclass
@@ -259,15 +258,76 @@ _TP_DESC_FLAGS_PATTERN = re.compile(
     r'__TP_DESC_FLAGS__\s*\(\s*\w+\s*,\s*(\w+)',
 )
 
+# Mapping from gate macros to the TEST_CASE arrays they enable
+_MACRO_TO_ARRAY = {
+    'INIT_MODE_NEEDED': 'testCases_Init',
+    'SRVC_MODE_NEEDED': 'testCases_Srvc',
+    'PRE_STAGE_NEEDED': 'testCasesPre',
+    'POST_STAGE_NEEDED': 'testCasesPost',
+}
 
-def parse_tc_names_from_content(content: str, include_srvc: bool = False) -> List[str]:
+
+def _strip_comments(line: str, in_block: bool) -> Tuple[str, bool]:
+    """Strip C-style comments from a line, tracking block comment state.
+
+    Returns (effective_text, still_in_block_comment).
     """
-    Extract test case names from __TP_DESC_FLAGS__ entries within testCases_Init
-    arrays (and optionally testCases_Srvc arrays) in a tp .c file's content.
+    effective = ''
+    i = 0
+    while i < len(line):
+        if in_block:
+            end = line.find('*/', i)
+            if end == -1:
+                break
+            in_block = False
+            i = end + 2
+        elif line[i:i+2] == '/*':
+            end = line.find('*/', i + 2)
+            if end == -1:
+                in_block = True
+                break
+            i = end + 2
+        elif line[i:i+2] == '//':
+            break
+        else:
+            effective += line[i]
+            i += 1
+    return effective, in_block
+
+
+def _detect_active_arrays(content: str) -> set:
+    """Detect which TEST_CASE arrays are active based on uncommented #define macros.
+
+    Scans for #define lines containing gate macros (e.g. __INIT_MODE_NEEDED__),
+    ignoring lines that are inside // or /* */ comments.
     """
-    target_arrays = {'testCases_Init'}
-    if include_srvc:
-        target_arrays.add('testCases_Srvc')
+    active = set()
+    in_block = False
+    for line in content.splitlines():
+        effective, in_block = _strip_comments(line, in_block)
+        effective = effective.strip()
+        if effective.startswith('#') and 'define' in effective:
+            for macro, array in _MACRO_TO_ARRAY.items():
+                if macro in effective:
+                    active.add(array)
+    return active
+
+
+def parse_tc_names_from_content(content: str) -> List[str]:
+    """
+    Extract test case names from __TP_DESC_FLAGS__ entries within active
+    TEST_CASE arrays in a tp .c file's content.
+
+    Determines which arrays are active by scanning for uncommented #define
+    gate macros:
+      - __INIT_MODE_NEEDED__  -> testCases_Init
+      - __SRVC_MODE_NEEDED__  -> testCases_Srvc
+      - __PRE_STAGE_NEEDED__  -> testCasesPre
+      - __POST_STAGE_NEEDED__ -> testCasesPost
+
+    Commented-out defines (// or /* */) are ignored.
+    """
+    target_arrays = _detect_active_arrays(content)
 
     tc_names = []
     seen = set()
@@ -293,7 +353,7 @@ def parse_tc_names_from_content(content: str, include_srvc: bool = False) -> Lis
     return tc_names
 
 
-def parse_tc_names_from_file(tp_path: str, include_srvc: bool = False, verbose: bool = False) -> List[str]:
+def parse_tc_names_from_file(tp_path: str, verbose: bool = False) -> List[str]:
     """
     Read a tp .c file and extract test case names from __TP_DESC_FLAGS__ entries
     within testCases_Init arrays (and optionally testCases_Srvc arrays), e.g.:
@@ -309,7 +369,7 @@ def parse_tc_names_from_file(tp_path: str, include_srvc: bool = False, verbose: 
         if verbose:
             print(f"  [VERBOSE] Could not read {tp_path}: {e}")
         return []
-    return parse_tc_names_from_content(content, include_srvc)
+    return parse_tc_names_from_content(content)
 
 
 def _extract_test_name(
@@ -324,10 +384,14 @@ def _extract_test_name(
 
     Returns the test name string, or None if the filename is unrecognized.
     """
+    # Try standard prefix, then ei_ variant, then subdir prefix
     prefix = f"tp_{variant}_"
+    ei_prefix = f"tp_ei_{variant}_"
     subdir_prefix = f"tp_{subdir_name}_" if subdir_name else None
     if tp_basename.startswith(prefix) and tp_basename.endswith(".c"):
         test_name = tp_basename[len(prefix):-2]
+    elif tp_basename.startswith(ei_prefix) and tp_basename.endswith(".c"):
+        test_name = tp_basename[len(ei_prefix):-2]
     elif subdir_prefix and tp_basename.startswith(subdir_prefix) and tp_basename.endswith(".c"):
         test_name = tp_basename[len(subdir_prefix):-2]
     else:
@@ -338,8 +402,8 @@ def _extract_test_name(
     return test_name
 
 
-def discover_tp_files(repo_path: str, include_srvc: bool = False, verbose: bool = False,
-                      component_glob: str = "SBL_BOOT_APP0*",
+def discover_tp_files(repo_path: str, verbose: bool = False,
+                      component_glob: str = "",
                       component_override: Optional[str] = None) -> List[TpFileInfo]:
     """
     Scan the local repo for tp_*.c files in <component_glob>/HLTP and <component_glob>/LLTP.
@@ -355,17 +419,17 @@ def discover_tp_files(repo_path: str, include_srvc: bool = False, verbose: bool 
 
     # Find all matching component directories
     pattern = os.path.join(native_dir, component_glob)
-    boot_app_dirs = sorted(glob.glob(pattern))
+    component_dirs = sorted(glob.glob(pattern))
 
-    if not boot_app_dirs:
+    if not component_dirs:
         print(f"Warning: No directories matching '{component_glob}' found in {native_dir}")
         return results
 
-    for boot_app_dir in boot_app_dirs:
-        variant = os.path.basename(boot_app_dir)
+    for component_dir in component_dirs:
+        variant = os.path.basename(component_dir)
 
         for test_type in ("HLTP", "LLTP"):
-            type_dir = os.path.join(boot_app_dir, test_type)
+            type_dir = os.path.join(component_dir, test_type)
             if not os.path.isdir(type_dir):
                 if verbose:
                     print(f"  [VERBOSE] No {test_type} directory in {variant}")
@@ -390,11 +454,17 @@ def discover_tp_files(repo_path: str, include_srvc: bool = False, verbose: bool 
                 if subdir_name:
                     tl_pattern_sub = os.path.join(search_dir, f"tl_{variant}_{subdir_name}.c")
                     tl_matches = glob.glob(tl_pattern_sub)
+                    if not tl_matches:
+                        tl_pattern_sub = os.path.join(search_dir, f"tl_ei_{variant}_{subdir_name}.c")
+                        tl_matches = glob.glob(tl_pattern_sub)
                     if tl_matches:
                         tl_filename = os.path.basename(tl_matches[0])
                 if not tl_filename:
                     tl_pattern = os.path.join(search_dir, f"tl_{variant}.c")
                     tl_matches = glob.glob(tl_pattern)
+                    if not tl_matches:
+                        tl_pattern = os.path.join(search_dir, f"tl_ei_{variant}.c")
+                        tl_matches = glob.glob(tl_pattern)
                     if tl_matches:
                         tl_filename = os.path.basename(tl_matches[0])
                 if not tl_filename:
@@ -407,16 +477,23 @@ def discover_tp_files(repo_path: str, include_srvc: bool = False, verbose: bool 
                 tp_pattern = os.path.join(search_dir, f"tp_{variant}_*.c")
                 tp_files_found = sorted(glob.glob(tp_pattern))
 
+                # Also match tp_ei_{variant}_*.c (alternate naming convention)
+                tp_ei_pattern = os.path.join(search_dir, f"tp_ei_{variant}_*.c")
+                for p in sorted(glob.glob(tp_ei_pattern)):
+                    if p not in set(tp_files_found):
+                        tp_files_found.append(p)
+                tp_files_found.sort()
+
                 # In subdirectories, tp files may also be named tp_{subdir}_*.c
                 # e.g. LLTP/bootMmu/tp_bootMmu_bootAppMmuInit.c
                 if subdir_name:
-                    tp_pattern_sub = os.path.join(search_dir, f"tp_{subdir_name}_*.c")
-                    tp_sub_found = sorted(glob.glob(tp_pattern_sub))
-                    # Add only files not already matched by the variant pattern
                     existing_paths = set(tp_files_found)
-                    for p in tp_sub_found:
-                        if p not in existing_paths:
-                            tp_files_found.append(p)
+                    for sub_pref in [f"tp_{subdir_name}_*.c", f"tp_ei_{subdir_name}_*.c"]:
+                        tp_pattern_sub = os.path.join(search_dir, sub_pref)
+                        for p in sorted(glob.glob(tp_pattern_sub)):
+                            if p not in existing_paths:
+                                tp_files_found.append(p)
+                                existing_paths.add(p)
                     tp_files_found.sort()
 
                 for tp_path in tp_files_found:
@@ -431,12 +508,12 @@ def discover_tp_files(repo_path: str, include_srvc: bool = False, verbose: bool 
                     rel_dir = os.path.relpath(search_dir, repo_path).replace("\\", "/")
 
                     # Parse TC names from tp file comments
-                    tc_names = parse_tc_names_from_file(tp_path, include_srvc, verbose)
+                    tc_names = parse_tc_names_from_file(tp_path, verbose)
 
                     info = TpFileInfo(
                         tp_filename=tp_basename,
                         tl_filename=tl_filename,
-                        boot_app_variant=variant,
+                        variant=variant,
                         test_type=test_type,
                         test_name=test_name,
                         dir_path=search_dir,
@@ -455,9 +532,8 @@ def discover_tp_files(repo_path: str, include_srvc: bool = False, verbose: bool 
 def discover_tp_files_remote(
     gitlab_client: GitLabRepoClient,
     ref: str,
-    include_srvc: bool = False,
     verbose: bool = False,
-    component_glob: str = "SBL_BOOT_APP0*",
+    component_glob: str = "",
     component_override: Optional[str] = None,
 ) -> List[TpFileInfo]:
     """
@@ -509,10 +585,14 @@ def discover_tp_files_remote(
                 tl_filename = None
                 if subdir_name:
                     tl_cand = f"tl_{variant}_{subdir_name}.c"
+                    if tl_cand not in file_names:
+                        tl_cand = f"tl_ei_{variant}_{subdir_name}.c"
                     if tl_cand in file_names:
                         tl_filename = tl_cand
                 if not tl_filename:
                     tl_cand = f"tl_{variant}.c"
+                    if tl_cand not in file_names:
+                        tl_cand = f"tl_ei_{variant}.c"
                     if tl_cand in file_names:
                         tl_filename = tl_cand
                 if not tl_filename:
@@ -520,19 +600,22 @@ def discover_tp_files_remote(
                     if tl_any:
                         tl_filename = tl_any[0]
 
-                # Find tp files matching variant pattern
+                # Find tp files matching variant pattern (including tp_ei_ variant)
                 tp_prefix = f"tp_{variant}_"
+                tp_ei_prefix = f"tp_ei_{variant}_"
                 tp_files_found = sorted(
                     f for f in file_names
-                    if f.startswith(tp_prefix) and f.endswith(".c")
+                    if (f.startswith(tp_prefix) or f.startswith(tp_ei_prefix)) and f.endswith(".c")
                 )
 
                 # In subdirectories, also match tp_{subdir}_*.c
                 if subdir_name:
-                    sub_prefix = f"tp_{subdir_name}_"
-                    for f in sorted(file_names):
-                        if f.startswith(sub_prefix) and f.endswith(".c") and f not in tp_files_found:
-                            tp_files_found.append(f)
+                    existing_set = set(tp_files_found)
+                    for sub_pref in [f"tp_{subdir_name}_", f"tp_ei_{subdir_name}_"]:
+                        for f in sorted(file_names):
+                            if f.startswith(sub_pref) and f.endswith(".c") and f not in existing_set:
+                                tp_files_found.append(f)
+                                existing_set.add(f)
                     tp_files_found.sort()
 
                 for tp_basename in tp_files_found:
@@ -547,12 +630,12 @@ def discover_tp_files_remote(
                     # Fetch file content from GitLab and parse TC names
                     tp_file_path = f"{search_path}/{tp_basename}"
                     content = gitlab_client.get_file_content(tp_file_path, ref)
-                    tc_names = parse_tc_names_from_content(content, include_srvc) if content else []
+                    tc_names = parse_tc_names_from_content(content) if content else []
 
                     info = TpFileInfo(
                         tp_filename=tp_basename,
                         tl_filename=tl_filename,
-                        boot_app_variant=variant,
+                        variant=variant,
                         test_type=test_type,
                         test_name=test_name,
                         dir_path=search_path,
@@ -642,23 +725,90 @@ def match_files_to_work_items(
         if verbose:
             print(f"  [VERBOSE] Group '{group_key}': {len(files)} file(s), {len(existing)} existing WI(s)")
 
-        # Match 1:1 by position
-        for i, tp_file in enumerate(files):
-            if i < len(existing):
-                wi_id, wi_title, _ = existing[i]
-                result.updates.append((wi_id, wi_title, tp_file))
-            else:
-                # Determine next available number
-                if existing:
-                    max_num = max(e[2] for e in existing)
+        if len(files) > 1 and len(existing) > 1:
+            # Smart matching: use TC overlap from Polarion to pair WIs with files
+            test_name = group_key.rsplit("_", 1)[0]
+            prefix = f"{test_name}_"
+
+            print(f"  Smart matching '{group_key}' ({len(files)} files, {len(existing)} WIs) — resolving TC links...")
+
+            # Fetch same-function TC titles for each existing WI
+            wi_tc_map: Dict[str, set] = {}
+            for wi_id, wi_title, num in existing:
+                all_titles = _fetch_linked_tc_titles(updater, wi_id)
+                same_func = {t for t in all_titles if t.startswith(prefix)}
+                wi_tc_map[wi_id] = same_func
+                if verbose:
+                    short = updater._extract_short_id(wi_id)
+                    print(f"    [VERBOSE] {short} ({wi_title}): {len(same_func)} same-function TC(s)")
+
+            # Build overlap scores for all (WI, file) pairs
+            overlaps = []
+            for wi_idx, (wi_id, wi_title, num) in enumerate(existing):
+                for file_idx, tp_file in enumerate(files):
+                    file_tc_set = set(tp_file.tc_names)
+                    overlap = len(wi_tc_map[wi_id] & file_tc_set)
+                    if overlap > 0:
+                        overlaps.append((overlap, wi_idx, file_idx))
+
+            # Greedy match: highest overlap first
+            overlaps.sort(key=lambda x: x[0], reverse=True)
+            matched_files: set = set()
+            matched_wis: set = set()
+            pairs: List[Tuple[int, int]] = []
+
+            for overlap, wi_idx, file_idx in overlaps:
+                if wi_idx not in matched_wis and file_idx not in matched_files:
+                    pairs.append((wi_idx, file_idx))
+                    matched_wis.add(wi_idx)
+                    matched_files.add(file_idx)
+                    if verbose:
+                        short = updater._extract_short_id(existing[wi_idx][0])
+                        print(f"    [VERBOSE] Matched {short} ({existing[wi_idx][1]}) ↔ {files[file_idx].variant} (overlap: {overlap})")
+
+            # Positional fallback for unmatched WIs/files
+            remaining_wis = [i for i in range(len(existing)) if i not in matched_wis]
+            remaining_files = [i for i in range(len(files)) if i not in matched_files]
+            for wi_idx, file_idx in zip(remaining_wis, remaining_files):
+                pairs.append((wi_idx, file_idx))
+                matched_files.add(file_idx)
+                if verbose:
+                    short = updater._extract_short_id(existing[wi_idx][0])
+                    print(f"    [VERBOSE] Fallback match {short} ({existing[wi_idx][1]}) ↔ {files[file_idx].variant}")
+
+            # Record updates
+            for wi_idx, file_idx in pairs:
+                wi_id, wi_title, _ = existing[wi_idx]
+                result.updates.append((wi_id, wi_title, files[file_idx]))
+
+            # Remaining files with no WI → creates
+            for file_idx in range(len(files)):
+                if file_idx not in matched_files:
+                    if existing:
+                        max_num = max(e[2] for e in existing)
+                    else:
+                        max_num = 0
+                    already_queued = sum(
+                        1 for _, c in result.creates if c.group_key == group_key
+                    )
+                    next_num = max_num + 1 + already_queued
+                    result.creates.append((next_num, files[file_idx]))
+        else:
+            # Simple 1:1 positional matching (single file or single WI)
+            for i, tp_file in enumerate(files):
+                if i < len(existing):
+                    wi_id, wi_title, _ = existing[i]
+                    result.updates.append((wi_id, wi_title, tp_file))
                 else:
-                    max_num = 0
-                # Account for already-queued creates in this group
-                already_queued = sum(
-                    1 for _, c in result.creates if c.group_key == group_key
-                )
-                next_num = max_num + 1 + already_queued
-                result.creates.append((next_num, tp_file))
+                    if existing:
+                        max_num = max(e[2] for e in existing)
+                    else:
+                        max_num = 0
+                    already_queued = sum(
+                        1 for _, c in result.creates if c.group_key == group_key
+                    )
+                    next_num = max_num + 1 + already_queued
+                    result.creates.append((next_num, tp_file))
 
     return result
 
@@ -715,14 +865,14 @@ def update_existing_work_item(
     category: str,
     dry_run: bool = True,
     verbose: bool = False,
-) -> Tuple[bool, bool]:
+) -> Tuple[bool, bool, set]:
     """Update an existing work item's hyperlinks, component, and category.
 
-    Returns (success, changes_needed).
+    Returns (success, changes_needed, current_uris).
     """
     short_id = updater._extract_short_id(wi_id)
     print(f"\n  Updating: {short_id} - {wi_title}")
-    print(f"    Matched to: {tp_file.boot_app_variant}/{tp_file.test_type}/{tp_file.tp_filename}")
+    print(f"    Matched to: {tp_file.variant}/{tp_file.test_type}/{tp_file.tp_filename}")
 
     # Fetch current hyperlinks
     url = f"{updater.base_url}/projects/{updater.project_id}/workitems/{short_id}"
@@ -731,7 +881,7 @@ def update_existing_work_item(
     resp = updater.session.get(url, params=params, verify=updater.verify_ssl)
     if resp.status_code != 200:
         print(f"    Error fetching work item: {resp.status_code}")
-        return False, False
+        return False, False, set()
 
     data = resp.json()
     attrs = data.get("data", {}).get("attributes", {})
@@ -785,31 +935,31 @@ def update_existing_work_item(
 
     if hyperlinks_aligned and component_aligned:
         print(f"    ✓ Hyperlinks and component already aligned")
-        return True, False
+        return True, False, current_uris
 
     # Changes needed — report details
     old_source = [link for link in current_links if _is_source_reference(link)]
     old_c_links = [link for link in current_links
                    if not _is_source_reference(link) and link.get("uri", "").endswith(".c")]
+    # Compute actual differences (URIs being removed vs added)
+    uris_to_remove = current_uris - desired_uris
+    uris_to_add = desired_uris - current_uris
     if dry_run:
         if current_status != "rework":
             print(f"    [DRY RUN] Would change status from '{current_status}' to 'rework'")
         if not hyperlinks_aligned:
-            print(f"    [DRY RUN] Would remove {len(old_source)} old source reference link(s):")
-            for link in old_source:
-                print(f"      - {link.get('uri', '?')}")
-            if old_c_links:
-                print(f"    [DRY RUN] Would remove {len(old_c_links)} additional .c hyperlink(s):")
-                for link in old_c_links:
-                    print(f"      - {link.get('uri', '?')}")
-            print(f"    [DRY RUN] Would add {len(new_source_links)} new source reference link(s):")
-            for link in new_source_links:
-                print(f"      + {link['uri']}")
-            if ccr_url and ccr_url not in existing_uris:
-                print(f"    [DRY RUN] Would add CCR internal reference:")
-                print(f"      + {ccr_url}")
-            elif ccr_url:
-                print(f"    [DRY RUN] CCR link already exists, skipping")
+            if uris_to_remove:
+                print(f"    [DRY RUN] Would remove {len(uris_to_remove)} hyperlink(s):")
+                for uri in sorted(uris_to_remove):
+                    print(f"      - {uri}")
+            if uris_to_add:
+                print(f"    [DRY RUN] Would add {len(uris_to_add)} hyperlink(s):")
+                for uri in sorted(uris_to_add):
+                    print(f"      + {uri}")
+            # Show what stays unchanged
+            unchanged_src = [link for link in old_source if link.get("uri", "") in desired_uris]
+            if unchanged_src:
+                print(f"    ✓ {len(unchanged_src)} source reference link(s) already aligned")
         else:
             print(f"    ✓ Hyperlinks already aligned")
         if not component_aligned:
@@ -818,14 +968,14 @@ def update_existing_work_item(
             print(f"    ✓ Component already aligned")
         # Category
         print(f"    [DRY RUN] Would set fld_category to '{category}'")
-        return True, True
+        return True, True, current_uris
 
     # Execute: status -> rework
     if current_status != "rework":
         print(f"    Changing status to 'rework'...")
         if not updater.update_work_item_status(wi_id, "rework", dry_run=False):
             print(f"    ✗ Failed to change status to 'rework', skipping")
-            return False, True
+            return False, True, current_uris
         print(f"    ✓ Status changed to 'rework'")
 
     # Execute: update hyperlinks (only if changed)
@@ -834,7 +984,7 @@ def update_existing_work_item(
             print(f"    ✓ Hyperlinks updated")
         else:
             print(f"    ✗ Failed to update hyperlinks")
-            return False, True
+            return False, True, current_uris
 
     # Execute: update fld_component (only if changed)
     if not component_aligned:
@@ -867,7 +1017,7 @@ def update_existing_work_item(
         print(f"      Response: {cat_resp.text[:500]}")
 
     # Note: status -> in_review is done after TC linking in the main flow
-    return True, True
+    return True, True, current_uris
 
 
 def create_new_work_item(
@@ -897,7 +1047,7 @@ def create_new_work_item(
 
     print(f"\n  Creating: {title}")
     print(f"    Component: {component}")
-    print(f"    Source: {tp_file.boot_app_variant}/{tp_file.test_type}/{tp_file.tp_filename}")
+    print(f"    Source: {tp_file.variant}/{tp_file.test_type}/{tp_file.tp_filename}")
     print(f"    Hyperlinks:")
     for link in hyperlinks:
         role_label = "source reference" if link["role"] == "ref_src" else "internal reference"
@@ -1031,6 +1181,36 @@ def _get_existing_tc_links(
             continue
         tc_links.append(item)
     return tc_links
+
+
+def _fetch_linked_tc_titles(
+    updater: PolarionSourceLinkUpdater,
+    wi_id: str,
+) -> set:
+    """Fetch titles of all non-derived linked work items on a WI (quiet, for matching)."""
+    existing = _get_existing_tc_links(updater, wi_id)
+    titles = set()
+    for item in existing:
+        rel_id = (item.get("relationships", {})
+                      .get("workItem", {})
+                      .get("data", {})
+                      .get("id", ""))
+        if rel_id:
+            target_short_id = updater._extract_short_id(rel_id)
+        else:
+            parts = item.get("id", "").split("/")
+            if len(parts) >= 3:
+                target_short_id = parts[-2]
+            else:
+                continue
+        url = f"{updater.base_url}/projects/{updater.project_id}/workitems/{target_short_id}"
+        params = {"fields[workitems]": "title"}
+        resp = updater.session.get(url, params=params, verify=updater.verify_ssl)
+        if resp.status_code == 200:
+            title = resp.json().get("data", {}).get("attributes", {}).get("title", "")
+            if title:
+                titles.add(title)
+    return titles
 
 
 def _resolve_existing_tc_links(
@@ -1210,7 +1390,7 @@ def link_test_cases_to_tp(
 
     # Check alignment
     if same_function_names == desired_names:
-        print(f"      ✓ TC links already aligned ({len(desired_names)} of the function"
+        print(f"      ✓ TC links already aligned ({len(desired_names)} TCs"
               + (f", {len(foreign_links)} foreign preserved" if foreign_links else "")
               + ")")
         return 0, True
@@ -1486,14 +1666,9 @@ Examples:
         help="Skip creating new work items, only update existing ones",
     )
     parser.add_argument(
-        "--include-srvc",
-        action="store_true",
-        help="Also parse TC names from testCases_Srvc arrays (by default only testCases_Init is parsed)",
-    )
-    parser.add_argument(
         "--component-glob",
-        default="SBL_BOOT_APP0*",
-        help="Glob pattern for component directories under native/ or SFORD_POS/ (default: SBL_BOOT_APP0*). "
+        required=True,
+        help="Glob pattern for component directories under native/ or SFORD_POS/ (e.g. SBL_BOOT_APP0*). "
              "If the glob starts with POSBSP, searches under SFORD_POS/; otherwise under native/.",
     )
     parser.add_argument(
@@ -1572,14 +1747,16 @@ Examples:
     else:
         print("EXECUTE MODE - Changes will be applied!")
     print("=" * 180)
+    print("\nLoading...", end="", flush=True)
 
     # Phase 0: Resolve branch
     ccr_id = args.ccr_id  # may be None if --branch was used
+    print("\r" + " " * 30 + "\r", end="", flush=True)
     if args.branch:
         branch_name = args.branch
-        print(f"\nPhase 0: Using branch '{branch_name}' (provided directly)")
+        print(f"Phase 0: Using branch '{branch_name}' (provided directly)")
     else:
-        print(f"\nPhase 0: Resolving CCR branch...")
+        print(f"Phase 0: Resolving CCR branch...")
         branch_name = resolve_ccr_branch(ccr_id, verbose=args.verbose)
 
     if use_remote:
@@ -1603,13 +1780,13 @@ Examples:
     if use_remote:
         tp_files = discover_tp_files_remote(
             gitlab_client, branch_name,
-            include_srvc=args.include_srvc, verbose=args.verbose,
+            verbose=args.verbose,
             component_glob=args.component_glob,
             component_override=args.component,
         )
     else:
         tp_files = discover_tp_files(
-            repo_path, include_srvc=args.include_srvc, verbose=args.verbose,
+            repo_path, verbose=args.verbose,
             component_glob=args.component_glob,
             component_override=args.component,
         )
@@ -1619,7 +1796,7 @@ Examples:
 
     by_variant: Dict[str, List[TpFileInfo]] = {}
     for f in tp_files:
-        by_variant.setdefault(f"{f.boot_app_variant}/{f.test_type}", []).append(f)
+        by_variant.setdefault(f"{f.variant}/{f.test_type}", []).append(f)
 
     print(f"Phase 1: Discovered {len(tp_files)} TP file(s) across {len(by_variant)} folder(s)")
 
@@ -1641,25 +1818,60 @@ Examples:
     )
     match_result = match_files_to_work_items(tp_files, updater, verbose=args.verbose)
 
-    # --- Resolved Mappings (printed immediately after matching) ---
+    # Identify multi-file groups (for showing variant in Resolved Mappings and Change Log)
+    _group_counts: Dict[str, int] = {}
+    for f in tp_files:
+        _group_counts[f.group_key] = _group_counts.get(f.group_key, 0) + 1
+    multi_file_groups = {k for k, v in _group_counts.items() if v > 1}
+
+    # --- Resolved Mappings and Polarion Work Items (printed immediately after matching) ---
     info_by_group: Dict[str, List[str]] = {}
     for wi_id, wi_title, tp_file in match_result.updates:
         short_id = updater._extract_short_id(wi_id)
         tl_url, tp_url = build_gitlab_urls(tp_file, gitlab_base)
-        lines = [f"  {short_id} - {wi_title}", ""]
+        lines = [f"  {short_id} - {wi_title}"]
+        if tp_file.group_key in multi_file_groups:
+            lines.append(f"          \u21b3 {tp_file.variant}")
+        lines.append("")
+        # Fetch linked TC titles and current hyperlinks to show alignment
+        prefix = f"{tp_file.test_name}_"
+        all_tc_titles = _fetch_linked_tc_titles(updater, wi_id)
+        foreign_tc_names = sorted(t for t in all_tc_titles if not t.startswith(prefix))
+        # Fetch current hyperlink URIs for alignment check
+        fetch_url = f"{updater.base_url}/projects/{updater.project_id}/workitems/{short_id}"
+        fetch_resp = updater.session.get(
+            fetch_url, params={"fields[workitems]": "hyperlinks"},
+            verify=updater.verify_ssl,
+        )
+        current_uris: set = set()
+        if fetch_resp.status_code == 200:
+            current_links = fetch_resp.json().get("data", {}).get("attributes", {}).get("hyperlinks", [])
+            current_uris = {link.get("uri", "") for link in current_links}
         if tp_file.tc_names:
             for tc_name in tp_file.tc_names:
-                lines.append(f"      [implements] {tc_name}")
+                if tc_name in all_tc_titles:
+                    lines.append(f"      \u2713 [implements] {tc_name}")
+                else:
+                    lines.append(f"      \u2717 [implements] {tc_name}")
+        if foreign_tc_names:
+            for tc_name in foreign_tc_names:
+                lines.append(f"      \u2713 [implements] {tc_name}  (foreign)")
+        if tp_file.tc_names or foreign_tc_names:
             lines.append("")
         if tl_url:
-            lines.append(f"      [source reference] {tl_url}")
-        lines.append(f"      [source reference] {tp_url}")
+            mark = "\u2713" if tl_url in current_uris else "\u2717"
+            lines.append(f"      {mark} [source reference] {tl_url}")
+        tp_mark = "\u2713" if tp_url in current_uris else "\u2717"
+        lines.append(f"      {tp_mark} [source reference] {tp_url}")
         info_by_group.setdefault(tp_file.group_key, []).append("\n".join(lines))
 
     for number, tp_file in match_result.creates:
         title = f"{tp_file.test_name}_{tp_file.test_type}_{number}"
         tl_url, tp_url = build_gitlab_urls(tp_file, gitlab_base)
-        lines = [f"  (new) {title}", ""]
+        lines = [f"  (new) {title}"]
+        if tp_file.group_key in multi_file_groups:
+            lines.append(f"          \u21b3 {tp_file.variant}")
+        lines.append("")
         if tp_file.tc_names:
             for tc_name in tp_file.tc_names:
                 lines.append(f"      [implements] {tc_name}")
@@ -1669,9 +1881,24 @@ Examples:
         lines.append(f"      [source reference] {tp_url}")
         info_by_group.setdefault(tp_file.group_key, []).append("\n".join(lines))
 
+    # Build a Polarion query showing all TP work item titles in this run
+    all_tp_titles = []
+    for wi_id, wi_title, tp_file in match_result.updates:
+        all_tp_titles.append(wi_title)
+    for number, tp_file in match_result.creates:
+        all_tp_titles.append(f"{tp_file.test_name}_{tp_file.test_type}_{number}")
+    if all_tp_titles:
+        title_query = " OR ".join(f"title:{t}" for t in all_tp_titles)
+        polarion_query = f"type:wi_testProcedure AND ({title_query})"
+        query_len = max(len(polarion_query), 80)
+        print(f"\n{'*' * query_len}")
+        print(f"(!) Paste Query below in the Polarion search to compare with the TPs fetched from CCR more easily :)")
+        print(f"{polarion_query}")
+        print(f"{'*' * query_len}")
+
     branch_label = f"CCR #{ccr_id} ({branch_name})" if ccr_id else branch_name
     print(f"\n{'=' * 180}")
-    print(f"Resolved Mappings from {branch_label}")
+    print(f"Resolved Mappings from {branch_label} and Polarion Work Items")
     print("=" * 180)
     first_group = True
     for group_key in sorted(info_by_group.keys()):
@@ -1711,7 +1938,7 @@ Examples:
                 component=args.component, category=args.category,
                 dry_run=dry_run, verbose=args.verbose,
             )
-            success, wi_changes = result[0], result[1]
+            success, wi_changes, wi_current_uris = result[0], result[1], result[2]
 
             if not success:
                 updated_fail += 1
@@ -1759,20 +1986,27 @@ Examples:
             if fully_aligned:
                 aligned_count += 1
                 foreign_count = len(resolved[3]) if resolved and resolved[3] else 0
-                tc_summary = f"{len(tp_file.tc_names)} of the function"
+                tc_summary = f"{len(tp_file.tc_names)} TCs"
                 if foreign_count:
                     tc_summary += f", {foreign_count} foreign"
-                lines = [f"  [ALIGNED \u2713] {short_id} - {wi_title}",
-                         f"      TCs already aligned ({tc_summary}) \u2713"]
+                lines = [f"  [ALIGNED] {short_id} - {wi_title}"]
+                if tp_file.group_key in multi_file_groups:
+                    lines.append(f"          \u21b3 {tp_file.variant}")
+                lines.append(f"      TCs already aligned ({tc_summary}) \u2713")
+                lines.append(f"      Source references already aligned \u2713")
+                if ccr_id:
+                    lines.append(f"      Internal reference already aligned \u2713")
                 change_entries_by_group.setdefault(tp_file.group_key, []).append("\n".join(lines))
             else:
                 updated_ok += 1
                 tl_url, tp_url = build_gitlab_urls(tp_file, gitlab_base)
                 tag = "[WOULD UPDATE]" if dry_run else "[UPDATED]"
                 lines = [f"  {tag} {short_id} - {wi_title}"]
+                if tp_file.group_key in multi_file_groups:
+                    lines.append(f"          \u21b3 {tp_file.variant}")
                 if tc_aligned and tp_file.tc_names:
                     foreign_count = len(resolved[3]) if resolved and resolved[3] else 0
-                    tc_summary = f"{len(tp_file.tc_names)} of the function"
+                    tc_summary = f"{len(tp_file.tc_names)} TCs"
                     if foreign_count:
                         tc_summary += f", {foreign_count} foreign"
                     lines.append(f"      TCs already aligned ({tc_summary}) \u2713")
@@ -1780,18 +2014,31 @@ Examples:
                     same_names = resolved[0] if resolved else set()
                     for tc_name in tp_file.tc_names:
                         if tc_name in same_names:
-                            lines.append(f"      [implements] {tc_name} \u2713")
+                            lines.append(f"      \u2713 [implements] {tc_name}")
                         elif tc_cache.get(tc_name) is None:
-                            lines.append(f"      [implements] {tc_name}  \u26a0 Work Item not found in Polarion - check TC name in TP file or Polarion")
+                            lines.append(f"      \u26a0 [implements] {tc_name}  Work Item not found in Polarion - check TC name in TP file or Polarion")
                         else:
-                            lines.append(f"      [implements] {tc_name}  [+] Currently missing - will be added")
+                            lines.append(f"      [+] [implements] {tc_name}  Currently missing - will be added")
                     if resolved and resolved[3]:
                         for tc_name in sorted(resolved[3]):
-                            lines.append(f"      [implements] {tc_name}  (foreign) \u2713")
+                            lines.append(f"      \u2713 [implements] {tc_name}  (foreign)")
                 lines.append("")
-                if tl_url:
-                    lines.append(f"      [source reference] {tl_url}")
-                lines.append(f"      [source reference] {tp_url}")
+                src_aligned = (tp_url in wi_current_uris and
+                               (not tl_url or tl_url in wi_current_uris))
+                if src_aligned:
+                    lines.append(f"      Source references already aligned \u2713")
+                else:
+                    if tl_url:
+                        mark = "\u2713" if tl_url in wi_current_uris else "[+]"
+                        lines.append(f"      {mark} [source reference] {tl_url}")
+                    tp_mark = "\u2713" if tp_url in wi_current_uris else "[+]"
+                    lines.append(f"      {tp_mark} [source reference] {tp_url}")
+                if ccr_id:
+                    ccr_url = build_ccr_url(ccr_id)
+                    if ccr_url in wi_current_uris:
+                        lines.append(f"      Internal reference already aligned \u2713")
+                    else:
+                        lines.append(f"      [+] [internal reference] {ccr_url}")
                 change_entries_by_group.setdefault(tp_file.group_key, []).append("\n".join(lines))
 
                 # Status → in_review (only when changes were/would be made)
@@ -1845,12 +2092,17 @@ Examples:
                 tl_url, tp_url = build_gitlab_urls(tp_file, gitlab_base)
                 tag = "[WOULD CREATE]" if dry_run else "[CREATED]"
                 lines = [f"  {tag} {title}"]
+                if tp_file.group_key in multi_file_groups:
+                    lines.append(f"          \u21b3 {tp_file.variant}")
                 for tc_name in tp_file.tc_names:
-                    lines.append(f"      [implements] {tc_name}")
+                    lines.append(f"      [+] [implements] {tc_name}")
                 lines.append("")
                 if tl_url:
-                    lines.append(f"      [source reference] {tl_url}")
-                lines.append(f"      [source reference] {tp_url}")
+                    lines.append(f"      [+] [source reference] {tl_url}")
+                lines.append(f"      [+] [source reference] {tp_url}")
+                if ccr_id:
+                    ccr_url = build_ccr_url(ccr_id)
+                    lines.append(f"      [+] [internal reference] {ccr_url}")
                 change_entries_by_group.setdefault(tp_file.group_key, []).append("\n".join(lines))
             else:
                 created_fail += 1
