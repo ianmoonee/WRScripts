@@ -8,7 +8,7 @@ updates existing items' hyperlinks, and creates new work items for unmatched fil
 
 Supports two modes:
   - Local mode (--repo-path): checks out the CCR branch locally and scans the filesystem.
-  - Remote mode (no --repo-path): browses the CCR branch via GitLab API (requires GITLAB_TOKEN).
+  - Remote mode (no --repo-path): browses the branch via GitLab API (requires GITLAB_TOKEN). Branch is resolved from --ccr-id or provided directly with --branch.
 
 Environment Variables Required:
 - POLARION_API_BASE: Base URL for Polarion API
@@ -62,7 +62,8 @@ class PolarionSourceLinkUpdater:
 
     def query_work_items(self, query: str) -> List[str]:
         """Query Polarion for work items matching the query. Returns list of work item IDs."""
-        print(f"Querying Polarion with: {query}")
+        if self.verbose:
+            print(f"  [VERBOSE] Querying Polarion with: {query}")
         url = f"{self.base_url}/projects/{self.project_id}/workitems"
         params = {
             'query': query,
@@ -81,7 +82,8 @@ class PolarionSourceLinkUpdater:
                 for item in items:
                     if isinstance(item, dict) and 'id' in item:
                         work_item_ids.append(item['id'])
-        print(f"Found {len(work_item_ids)} work items matching query")
+        if self.verbose:
+            print(f"  [VERBOSE] Found {len(work_item_ids)} work items matching query")
         return work_item_ids
 
     @staticmethod
@@ -139,8 +141,7 @@ DEFAULT_GITLAB_BASE = (
     "https://ccn-gitlab.wrs.com/shallowford/project/wassp/-/blob/wassp-jenkins-nth"
 )
 
-# NOTE: hostname is "codeocolab" here vs "codecolab" in CCN_API_BASE — verify this is correct.
-CCR_URL_TEMPLATE = "https://ccn-codeocolab.wrs.com:8443/ui#reviewid={ccr_id}"
+CCR_URL_TEMPLATE = "https://ccn-codecolab.wrs.com:8443/ui#review:id={ccr_id}"
 
 
 class GitLabRepoClient:
@@ -204,9 +205,9 @@ class GitLabRepoClient:
 @dataclass
 class TpFileInfo:
     """Represents a discovered tp_*.c file and its context."""
-    tp_filename: str          # e.g. tp_SBL_BOOT_APP0_applyWriteProtect.c
-    tl_filename: Optional[str]  # e.g. tl_SBL_BOOT_APP0.c (may be None if missing)
-    boot_app_variant: str     # e.g. SBL_BOOT_APP0
+    tp_filename: str          # e.g. tp_POSBSP_SSD_NVME0_nvmeInit.c
+    tl_filename: Optional[str]  # e.g. tl_POSBSP_SSD_NVME0.c (may be None if missing)
+    variant: str              # e.g. POSBSP_SSD_NVME0 or SBL_BOOT_APP0
     test_type: str            # HLTP or LLTP
     test_name: str            # e.g. applyWriteProtect
     dir_path: str             # absolute path to the HLTP/LLTP directory
@@ -223,9 +224,9 @@ class TpFileInfo:
         """Derive Polarion component from variant (strip SBL_ prefix), or use override."""
         if self.component_override:
             return self.component_override
-        if self.boot_app_variant.startswith("SBL_"):
-            return self.boot_app_variant[4:]
-        return self.boot_app_variant
+        if self.variant.startswith("SBL_"):
+            return self.variant[4:]
+        return self.variant
 
     @property
     def group_key(self) -> str:
@@ -234,9 +235,9 @@ class TpFileInfo:
 
     @property
     def sort_key(self) -> Tuple[int, str]:
-        """Sort key: base variant (SBL_BOOT_APP0) first, then alphabetical."""
-        is_base = 0 if self.boot_app_variant == "SBL_BOOT_APP0" else 1
-        return (is_base, self.boot_app_variant)
+        """Sort key: base variant first, then alphabetical."""
+        is_base = 0 if self.variant == "SBL_BOOT_APP0" else 1
+        return (is_base, self.variant)
 
 
 @dataclass
@@ -257,15 +258,76 @@ _TP_DESC_FLAGS_PATTERN = re.compile(
     r'__TP_DESC_FLAGS__\s*\(\s*\w+\s*,\s*(\w+)',
 )
 
+# Mapping from gate macros to the TEST_CASE arrays they enable
+_MACRO_TO_ARRAY = {
+    'INIT_MODE_NEEDED': 'testCases_Init',
+    'SRVC_MODE_NEEDED': 'testCases_Srvc',
+    'PRE_STAGE_NEEDED': 'testCasesPre',
+    'POST_STAGE_NEEDED': 'testCasesPost',
+}
 
-def parse_tc_names_from_content(content: str, include_srvc: bool = False) -> List[str]:
+
+def _strip_comments(line: str, in_block: bool) -> Tuple[str, bool]:
+    """Strip C-style comments from a line, tracking block comment state.
+
+    Returns (effective_text, still_in_block_comment).
     """
-    Extract test case names from __TP_DESC_FLAGS__ entries within testCases_Init
-    arrays (and optionally testCases_Srvc arrays) in a tp .c file's content.
+    effective = ''
+    i = 0
+    while i < len(line):
+        if in_block:
+            end = line.find('*/', i)
+            if end == -1:
+                break
+            in_block = False
+            i = end + 2
+        elif line[i:i+2] == '/*':
+            end = line.find('*/', i + 2)
+            if end == -1:
+                in_block = True
+                break
+            i = end + 2
+        elif line[i:i+2] == '//':
+            break
+        else:
+            effective += line[i]
+            i += 1
+    return effective, in_block
+
+
+def _detect_active_arrays(content: str) -> set:
+    """Detect which TEST_CASE arrays are active based on uncommented #define macros.
+
+    Scans for #define lines containing gate macros (e.g. __INIT_MODE_NEEDED__),
+    ignoring lines that are inside // or /* */ comments.
     """
-    target_arrays = {'testCases_Init'}
-    if include_srvc:
-        target_arrays.add('testCases_Srvc')
+    active = set()
+    in_block = False
+    for line in content.splitlines():
+        effective, in_block = _strip_comments(line, in_block)
+        effective = effective.strip()
+        if effective.startswith('#') and 'define' in effective:
+            for macro, array in _MACRO_TO_ARRAY.items():
+                if macro in effective:
+                    active.add(array)
+    return active
+
+
+def parse_tc_names_from_content(content: str) -> List[str]:
+    """
+    Extract test case names from __TP_DESC_FLAGS__ entries within active
+    TEST_CASE arrays in a tp .c file's content.
+
+    Determines which arrays are active by scanning for uncommented #define
+    gate macros:
+      - __INIT_MODE_NEEDED__  -> testCases_Init
+      - __SRVC_MODE_NEEDED__  -> testCases_Srvc
+      - __PRE_STAGE_NEEDED__  -> testCasesPre
+      - __POST_STAGE_NEEDED__ -> testCasesPost
+
+    Commented-out defines (// or /* */) are ignored.
+    """
+    target_arrays = _detect_active_arrays(content)
 
     tc_names = []
     seen = set()
@@ -291,7 +353,7 @@ def parse_tc_names_from_content(content: str, include_srvc: bool = False) -> Lis
     return tc_names
 
 
-def parse_tc_names_from_file(tp_path: str, include_srvc: bool = False, verbose: bool = False) -> List[str]:
+def parse_tc_names_from_file(tp_path: str, verbose: bool = False) -> List[str]:
     """
     Read a tp .c file and extract test case names from __TP_DESC_FLAGS__ entries
     within testCases_Init arrays (and optionally testCases_Srvc arrays), e.g.:
@@ -307,7 +369,7 @@ def parse_tc_names_from_file(tp_path: str, include_srvc: bool = False, verbose: 
         if verbose:
             print(f"  [VERBOSE] Could not read {tp_path}: {e}")
         return []
-    return parse_tc_names_from_content(content, include_srvc)
+    return parse_tc_names_from_content(content)
 
 
 def _extract_test_name(
@@ -322,10 +384,14 @@ def _extract_test_name(
 
     Returns the test name string, or None if the filename is unrecognized.
     """
+    # Try standard prefix, then ei_ variant, then subdir prefix
     prefix = f"tp_{variant}_"
+    ei_prefix = f"tp_ei_{variant}_"
     subdir_prefix = f"tp_{subdir_name}_" if subdir_name else None
     if tp_basename.startswith(prefix) and tp_basename.endswith(".c"):
         test_name = tp_basename[len(prefix):-2]
+    elif tp_basename.startswith(ei_prefix) and tp_basename.endswith(".c"):
+        test_name = tp_basename[len(ei_prefix):-2]
     elif subdir_prefix and tp_basename.startswith(subdir_prefix) and tp_basename.endswith(".c"):
         test_name = tp_basename[len(subdir_prefix):-2]
     else:
@@ -336,8 +402,8 @@ def _extract_test_name(
     return test_name
 
 
-def discover_tp_files(repo_path: str, include_srvc: bool = False, verbose: bool = False,
-                      component_glob: str = "SBL_BOOT_APP0*",
+def discover_tp_files(repo_path: str, verbose: bool = False,
+                      component_glob: str = "",
                       component_override: Optional[str] = None) -> List[TpFileInfo]:
     """
     Scan the local repo for tp_*.c files in <component_glob>/HLTP and <component_glob>/LLTP.
@@ -353,17 +419,17 @@ def discover_tp_files(repo_path: str, include_srvc: bool = False, verbose: bool 
 
     # Find all matching component directories
     pattern = os.path.join(native_dir, component_glob)
-    boot_app_dirs = sorted(glob.glob(pattern))
+    component_dirs = sorted(glob.glob(pattern))
 
-    if not boot_app_dirs:
+    if not component_dirs:
         print(f"Warning: No directories matching '{component_glob}' found in {native_dir}")
         return results
 
-    for boot_app_dir in boot_app_dirs:
-        variant = os.path.basename(boot_app_dir)
+    for component_dir in component_dirs:
+        variant = os.path.basename(component_dir)
 
         for test_type in ("HLTP", "LLTP"):
-            type_dir = os.path.join(boot_app_dir, test_type)
+            type_dir = os.path.join(component_dir, test_type)
             if not os.path.isdir(type_dir):
                 if verbose:
                     print(f"  [VERBOSE] No {test_type} directory in {variant}")
@@ -388,11 +454,17 @@ def discover_tp_files(repo_path: str, include_srvc: bool = False, verbose: bool 
                 if subdir_name:
                     tl_pattern_sub = os.path.join(search_dir, f"tl_{variant}_{subdir_name}.c")
                     tl_matches = glob.glob(tl_pattern_sub)
+                    if not tl_matches:
+                        tl_pattern_sub = os.path.join(search_dir, f"tl_ei_{variant}_{subdir_name}.c")
+                        tl_matches = glob.glob(tl_pattern_sub)
                     if tl_matches:
                         tl_filename = os.path.basename(tl_matches[0])
                 if not tl_filename:
                     tl_pattern = os.path.join(search_dir, f"tl_{variant}.c")
                     tl_matches = glob.glob(tl_pattern)
+                    if not tl_matches:
+                        tl_pattern = os.path.join(search_dir, f"tl_ei_{variant}.c")
+                        tl_matches = glob.glob(tl_pattern)
                     if tl_matches:
                         tl_filename = os.path.basename(tl_matches[0])
                 if not tl_filename:
@@ -405,16 +477,23 @@ def discover_tp_files(repo_path: str, include_srvc: bool = False, verbose: bool 
                 tp_pattern = os.path.join(search_dir, f"tp_{variant}_*.c")
                 tp_files_found = sorted(glob.glob(tp_pattern))
 
+                # Also match tp_ei_{variant}_*.c (alternate naming convention)
+                tp_ei_pattern = os.path.join(search_dir, f"tp_ei_{variant}_*.c")
+                for p in sorted(glob.glob(tp_ei_pattern)):
+                    if p not in set(tp_files_found):
+                        tp_files_found.append(p)
+                tp_files_found.sort()
+
                 # In subdirectories, tp files may also be named tp_{subdir}_*.c
                 # e.g. LLTP/bootMmu/tp_bootMmu_bootAppMmuInit.c
                 if subdir_name:
-                    tp_pattern_sub = os.path.join(search_dir, f"tp_{subdir_name}_*.c")
-                    tp_sub_found = sorted(glob.glob(tp_pattern_sub))
-                    # Add only files not already matched by the variant pattern
                     existing_paths = set(tp_files_found)
-                    for p in tp_sub_found:
-                        if p not in existing_paths:
-                            tp_files_found.append(p)
+                    for sub_pref in [f"tp_{subdir_name}_*.c", f"tp_ei_{subdir_name}_*.c"]:
+                        tp_pattern_sub = os.path.join(search_dir, sub_pref)
+                        for p in sorted(glob.glob(tp_pattern_sub)):
+                            if p not in existing_paths:
+                                tp_files_found.append(p)
+                                existing_paths.add(p)
                     tp_files_found.sort()
 
                 for tp_path in tp_files_found:
@@ -429,12 +508,12 @@ def discover_tp_files(repo_path: str, include_srvc: bool = False, verbose: bool 
                     rel_dir = os.path.relpath(search_dir, repo_path).replace("\\", "/")
 
                     # Parse TC names from tp file comments
-                    tc_names = parse_tc_names_from_file(tp_path, include_srvc, verbose)
+                    tc_names = parse_tc_names_from_file(tp_path, verbose)
 
                     info = TpFileInfo(
                         tp_filename=tp_basename,
                         tl_filename=tl_filename,
-                        boot_app_variant=variant,
+                        variant=variant,
                         test_type=test_type,
                         test_name=test_name,
                         dir_path=search_dir,
@@ -453,9 +532,8 @@ def discover_tp_files(repo_path: str, include_srvc: bool = False, verbose: bool 
 def discover_tp_files_remote(
     gitlab_client: GitLabRepoClient,
     ref: str,
-    include_srvc: bool = False,
     verbose: bool = False,
-    component_glob: str = "SBL_BOOT_APP0*",
+    component_glob: str = "",
     component_override: Optional[str] = None,
 ) -> List[TpFileInfo]:
     """
@@ -507,10 +585,14 @@ def discover_tp_files_remote(
                 tl_filename = None
                 if subdir_name:
                     tl_cand = f"tl_{variant}_{subdir_name}.c"
+                    if tl_cand not in file_names:
+                        tl_cand = f"tl_ei_{variant}_{subdir_name}.c"
                     if tl_cand in file_names:
                         tl_filename = tl_cand
                 if not tl_filename:
                     tl_cand = f"tl_{variant}.c"
+                    if tl_cand not in file_names:
+                        tl_cand = f"tl_ei_{variant}.c"
                     if tl_cand in file_names:
                         tl_filename = tl_cand
                 if not tl_filename:
@@ -518,19 +600,22 @@ def discover_tp_files_remote(
                     if tl_any:
                         tl_filename = tl_any[0]
 
-                # Find tp files matching variant pattern
+                # Find tp files matching variant pattern (including tp_ei_ variant)
                 tp_prefix = f"tp_{variant}_"
+                tp_ei_prefix = f"tp_ei_{variant}_"
                 tp_files_found = sorted(
                     f for f in file_names
-                    if f.startswith(tp_prefix) and f.endswith(".c")
+                    if (f.startswith(tp_prefix) or f.startswith(tp_ei_prefix)) and f.endswith(".c")
                 )
 
                 # In subdirectories, also match tp_{subdir}_*.c
                 if subdir_name:
-                    sub_prefix = f"tp_{subdir_name}_"
-                    for f in sorted(file_names):
-                        if f.startswith(sub_prefix) and f.endswith(".c") and f not in tp_files_found:
-                            tp_files_found.append(f)
+                    existing_set = set(tp_files_found)
+                    for sub_pref in [f"tp_{subdir_name}_", f"tp_ei_{subdir_name}_"]:
+                        for f in sorted(file_names):
+                            if f.startswith(sub_pref) and f.endswith(".c") and f not in existing_set:
+                                tp_files_found.append(f)
+                                existing_set.add(f)
                     tp_files_found.sort()
 
                 for tp_basename in tp_files_found:
@@ -545,12 +630,12 @@ def discover_tp_files_remote(
                     # Fetch file content from GitLab and parse TC names
                     tp_file_path = f"{search_path}/{tp_basename}"
                     content = gitlab_client.get_file_content(tp_file_path, ref)
-                    tc_names = parse_tc_names_from_content(content, include_srvc) if content else []
+                    tc_names = parse_tc_names_from_content(content) if content else []
 
                     info = TpFileInfo(
                         tp_filename=tp_basename,
                         tl_filename=tl_filename,
-                        boot_app_variant=variant,
+                        variant=variant,
                         test_type=test_type,
                         test_name=test_name,
                         dir_path=search_path,
@@ -610,7 +695,8 @@ def query_existing_work_items(
         if match:
             num = int(match.group(1))
             results.append((wi_id, title, num))
-            print(f"      -> {short_id} - {title}")
+            if verbose:
+                print(f"      -> {short_id} - {title}")
 
     results.sort(key=lambda x: x[2])
     return results
@@ -639,23 +725,90 @@ def match_files_to_work_items(
         if verbose:
             print(f"  [VERBOSE] Group '{group_key}': {len(files)} file(s), {len(existing)} existing WI(s)")
 
-        # Match 1:1 by position
-        for i, tp_file in enumerate(files):
-            if i < len(existing):
-                wi_id, wi_title, _ = existing[i]
-                result.updates.append((wi_id, wi_title, tp_file))
-            else:
-                # Determine next available number
-                if existing:
-                    max_num = max(e[2] for e in existing)
+        if len(files) > 1 and len(existing) > 1:
+            # Smart matching: use TC overlap from Polarion to pair WIs with files
+            test_name = group_key.rsplit("_", 1)[0]
+            prefix = f"{test_name}_"
+
+            print(f"  Smart matching '{group_key}' ({len(files)} files, {len(existing)} WIs) — resolving TC links...")
+
+            # Fetch same-function TC titles for each existing WI
+            wi_tc_map: Dict[str, set] = {}
+            for wi_id, wi_title, num in existing:
+                all_titles = _fetch_linked_tc_titles(updater, wi_id)
+                same_func = {t for t in all_titles if t.startswith(prefix)}
+                wi_tc_map[wi_id] = same_func
+                if verbose:
+                    short = updater._extract_short_id(wi_id)
+                    print(f"    [VERBOSE] {short} ({wi_title}): {len(same_func)} same-function TC(s)")
+
+            # Build overlap scores for all (WI, file) pairs
+            overlaps = []
+            for wi_idx, (wi_id, wi_title, num) in enumerate(existing):
+                for file_idx, tp_file in enumerate(files):
+                    file_tc_set = set(tp_file.tc_names)
+                    overlap = len(wi_tc_map[wi_id] & file_tc_set)
+                    if overlap > 0:
+                        overlaps.append((overlap, wi_idx, file_idx))
+
+            # Greedy match: highest overlap first
+            overlaps.sort(key=lambda x: x[0], reverse=True)
+            matched_files: set = set()
+            matched_wis: set = set()
+            pairs: List[Tuple[int, int]] = []
+
+            for overlap, wi_idx, file_idx in overlaps:
+                if wi_idx not in matched_wis and file_idx not in matched_files:
+                    pairs.append((wi_idx, file_idx))
+                    matched_wis.add(wi_idx)
+                    matched_files.add(file_idx)
+                    if verbose:
+                        short = updater._extract_short_id(existing[wi_idx][0])
+                        print(f"    [VERBOSE] Matched {short} ({existing[wi_idx][1]}) ↔ {files[file_idx].variant} (overlap: {overlap})")
+
+            # Positional fallback for unmatched WIs/files
+            remaining_wis = [i for i in range(len(existing)) if i not in matched_wis]
+            remaining_files = [i for i in range(len(files)) if i not in matched_files]
+            for wi_idx, file_idx in zip(remaining_wis, remaining_files):
+                pairs.append((wi_idx, file_idx))
+                matched_files.add(file_idx)
+                if verbose:
+                    short = updater._extract_short_id(existing[wi_idx][0])
+                    print(f"    [VERBOSE] Fallback match {short} ({existing[wi_idx][1]}) ↔ {files[file_idx].variant}")
+
+            # Record updates
+            for wi_idx, file_idx in pairs:
+                wi_id, wi_title, _ = existing[wi_idx]
+                result.updates.append((wi_id, wi_title, files[file_idx]))
+
+            # Remaining files with no WI → creates
+            for file_idx in range(len(files)):
+                if file_idx not in matched_files:
+                    if existing:
+                        max_num = max(e[2] for e in existing)
+                    else:
+                        max_num = 0
+                    already_queued = sum(
+                        1 for _, c in result.creates if c.group_key == group_key
+                    )
+                    next_num = max_num + 1 + already_queued
+                    result.creates.append((next_num, files[file_idx]))
+        else:
+            # Simple 1:1 positional matching (single file or single WI)
+            for i, tp_file in enumerate(files):
+                if i < len(existing):
+                    wi_id, wi_title, _ = existing[i]
+                    result.updates.append((wi_id, wi_title, tp_file))
                 else:
-                    max_num = 0
-                # Account for already-queued creates in this group
-                already_queued = sum(
-                    1 for _, c in result.creates if c.group_key == group_key
-                )
-                next_num = max_num + 1 + already_queued
-                result.creates.append((next_num, tp_file))
+                    if existing:
+                        max_num = max(e[2] for e in existing)
+                    else:
+                        max_num = 0
+                    already_queued = sum(
+                        1 for _, c in result.creates if c.group_key == group_key
+                    )
+                    next_num = max_num + 1 + already_queued
+                    result.creates.append((next_num, tp_file))
 
     return result
 
@@ -687,6 +840,20 @@ def _is_source_reference(link: dict) -> bool:
     return "ref_src" in role_id.lower() or "source" in role_id.lower()
 
 
+def _normalize_hyperlinks(links: List[Dict]) -> set:
+    """Normalize hyperlinks to a set of (role, uri) tuples for comparison."""
+    result = set()
+    for link in links:
+        role = link.get("role", "")
+        if isinstance(role, dict):
+            role = role.get("id", "")
+        else:
+            role = str(role)
+        uri = link.get("uri", "")
+        result.add((role, uri))
+    return result
+
+
 def update_existing_work_item(
     updater: PolarionSourceLinkUpdater,
     wi_id: str,
@@ -698,11 +865,14 @@ def update_existing_work_item(
     category: str,
     dry_run: bool = True,
     verbose: bool = False,
-) -> bool:
-    """Update an existing work item's hyperlinks, component, and category."""
+) -> Tuple[bool, bool, set]:
+    """Update an existing work item's hyperlinks, component, and category.
+
+    Returns (success, changes_needed, current_uris).
+    """
     short_id = updater._extract_short_id(wi_id)
     print(f"\n  Updating: {short_id} - {wi_title}")
-    print(f"    Matched to: {tp_file.boot_app_variant}/{tp_file.test_type}/{tp_file.tp_filename}")
+    print(f"    Matched to: {tp_file.variant}/{tp_file.test_type}/{tp_file.tp_filename}")
 
     # Fetch current hyperlinks
     url = f"{updater.base_url}/projects/{updater.project_id}/workitems/{short_id}"
@@ -711,7 +881,7 @@ def update_existing_work_item(
     resp = updater.session.get(url, params=params, verify=updater.verify_ssl)
     if resp.status_code != 200:
         print(f"    Error fetching work item: {resp.status_code}")
-        return False
+        return False, False, set()
 
     data = resp.json()
     attrs = data.get("data", {}).get("attributes", {})
@@ -744,54 +914,80 @@ def update_existing_work_item(
     if ccr_url and ccr_url not in existing_uris:
         updated_hyperlinks.append(new_ccr_link)
 
-    # Report changes
+    # --- Alignment check (compare by URI sets — immune to role format differences) ---
+    current_uris = {link.get("uri", "") for link in current_links}
+    desired_uris = {link.get("uri", "") for link in updated_hyperlinks}
+    hyperlinks_aligned = current_uris == desired_uris
+
+    desired_component = f"comp_{component}"
+    component_aligned = current_component == desired_component
+
+    if verbose:
+        if not hyperlinks_aligned:
+            extra = current_uris - desired_uris
+            missing = desired_uris - current_uris
+            if extra:
+                print(f"    [VERBOSE] Hyperlinks to remove: {extra}")
+            if missing:
+                print(f"    [VERBOSE] Hyperlinks to add:    {missing}")
+        if not component_aligned:
+            print(f"    [VERBOSE] Component: '{current_component}' → '{desired_component}'")
+
+    if hyperlinks_aligned and component_aligned:
+        print(f"    ✓ Hyperlinks and component already aligned")
+        return True, False, current_uris
+
+    # Changes needed — report details
     old_source = [link for link in current_links if _is_source_reference(link)]
     old_c_links = [link for link in current_links
                    if not _is_source_reference(link) and link.get("uri", "").endswith(".c")]
+    # Compute actual differences (URIs being removed vs added)
+    uris_to_remove = current_uris - desired_uris
+    uris_to_add = desired_uris - current_uris
     if dry_run:
         if current_status != "rework":
             print(f"    [DRY RUN] Would change status from '{current_status}' to 'rework'")
-        print(f"    [DRY RUN] Would remove {len(old_source)} old source reference link(s):")
-        for link in old_source:
-            print(f"      - {link.get('uri', '?')}")
-        if old_c_links:
-            print(f"    [DRY RUN] Would remove {len(old_c_links)} additional .c hyperlink(s):")
-            for link in old_c_links:
-                print(f"      - {link.get('uri', '?')}")
-        print(f"    [DRY RUN] Would add {len(new_source_links)} new source reference link(s):")
-        for link in new_source_links:
-            print(f"      + {link['uri']}")
-        if ccr_url and ccr_url not in existing_uris:
-            print(f"    [DRY RUN] Would add CCR internal reference:")
-            print(f"      + {ccr_url}")
-        elif ccr_url:
-            print(f"    [DRY RUN] CCR link already exists, skipping")
-        # Component
-        desired_component = f"comp_{component}"
-        if current_component != desired_component:
+        if not hyperlinks_aligned:
+            if uris_to_remove:
+                print(f"    [DRY RUN] Would remove {len(uris_to_remove)} hyperlink(s):")
+                for uri in sorted(uris_to_remove):
+                    print(f"      - {uri}")
+            if uris_to_add:
+                print(f"    [DRY RUN] Would add {len(uris_to_add)} hyperlink(s):")
+                for uri in sorted(uris_to_add):
+                    print(f"      + {uri}")
+            # Show what stays unchanged
+            unchanged_src = [link for link in old_source if link.get("uri", "") in desired_uris]
+            if unchanged_src:
+                print(f"    ✓ {len(unchanged_src)} source reference link(s) already aligned")
+        else:
+            print(f"    ✓ Hyperlinks already aligned")
+        if not component_aligned:
             print(f"    [DRY RUN] Would update fld_component from '{current_component}' to '{desired_component}'")
+        else:
+            print(f"    ✓ Component already aligned")
         # Category
         print(f"    [DRY RUN] Would set fld_category to '{category}'")
-        return True
+        return True, True, current_uris
 
     # Execute: status -> rework
     if current_status != "rework":
         print(f"    Changing status to 'rework'...")
         if not updater.update_work_item_status(wi_id, "rework", dry_run=False):
             print(f"    ✗ Failed to change status to 'rework', skipping")
-            return False
+            return False, True, current_uris
         print(f"    ✓ Status changed to 'rework'")
 
-    # Execute: update hyperlinks
-    if updater.update_work_item_hyperlinks(wi_id, updated_hyperlinks, dry_run=False):
-        print(f"    ✓ Hyperlinks updated")
-    else:
-        print(f"    ✗ Failed to update hyperlinks")
-        return False
+    # Execute: update hyperlinks (only if changed)
+    if not hyperlinks_aligned:
+        if updater.update_work_item_hyperlinks(wi_id, updated_hyperlinks, dry_run=False):
+            print(f"    ✓ Hyperlinks updated")
+        else:
+            print(f"    ✗ Failed to update hyperlinks")
+            return False, True, current_uris
 
-    # Execute: update fld_component
-    desired_component = f"comp_{component}"
-    if current_component != desired_component:
+    # Execute: update fld_component (only if changed)
+    if not component_aligned:
         if updater.update_work_item_attributes(wi_id, {"fld_component": desired_component}, dry_run=False):
             print(f"    ✓ Component updated to '{desired_component}'")
         else:
@@ -821,7 +1017,7 @@ def update_existing_work_item(
         print(f"      Response: {cat_resp.text[:500]}")
 
     # Note: status -> in_review is done after TC linking in the main flow
-    return True
+    return True, True, current_uris
 
 
 def create_new_work_item(
@@ -851,7 +1047,7 @@ def create_new_work_item(
 
     print(f"\n  Creating: {title}")
     print(f"    Component: {component}")
-    print(f"    Source: {tp_file.boot_app_variant}/{tp_file.test_type}/{tp_file.tp_filename}")
+    print(f"    Source: {tp_file.variant}/{tp_file.test_type}/{tp_file.tp_filename}")
     print(f"    Hyperlinks:")
     for link in hyperlinks:
         role_label = "source reference" if link["role"] == "ref_src" else "internal reference"
@@ -987,6 +1183,110 @@ def _get_existing_tc_links(
     return tc_links
 
 
+def _fetch_linked_tc_titles(
+    updater: PolarionSourceLinkUpdater,
+    wi_id: str,
+) -> set:
+    """Fetch titles of all non-derived linked work items on a WI (quiet, for matching)."""
+    existing = _get_existing_tc_links(updater, wi_id)
+    titles = set()
+    for item in existing:
+        rel_id = (item.get("relationships", {})
+                      .get("workItem", {})
+                      .get("data", {})
+                      .get("id", ""))
+        if rel_id:
+            target_short_id = updater._extract_short_id(rel_id)
+        else:
+            parts = item.get("id", "").split("/")
+            if len(parts) >= 3:
+                target_short_id = parts[-2]
+            else:
+                continue
+        url = f"{updater.base_url}/projects/{updater.project_id}/workitems/{target_short_id}"
+        params = {"fields[workitems]": "title"}
+        resp = updater.session.get(url, params=params, verify=updater.verify_ssl)
+        if resp.status_code == 200:
+            title = resp.json().get("data", {}).get("attributes", {}).get("title", "")
+            if title:
+                titles.add(title)
+    return titles
+
+
+def _resolve_existing_tc_links(
+    updater: PolarionSourceLinkUpdater,
+    tp_wi_id: str,
+    test_name: str,
+    verbose: bool = False,
+) -> Tuple[set, List[Dict], List[Dict], set]:
+    """
+    Classify existing TC links on a TP as same-function or foreign.
+
+    A TC is "same-function" if its title starts with '{test_name}_'.
+    Everything else is foreign (belongs to a different function's TP).
+
+    Returns (same_function_tc_names, same_function_links, foreign_links, foreign_tc_names).
+    """
+    existing = _get_existing_tc_links(updater, tp_wi_id, verbose)
+    if not existing:
+        return set(), [], [], set()
+
+    same_function_names: set = set()
+    same_function_links: List[Dict] = []
+    foreign_links: List[Dict] = []
+    foreign_names: set = set()
+    prefix = f"{test_name}_"
+
+    tp_short = updater._extract_short_id(tp_wi_id)
+    print(f"      Resolving {len(existing)} existing TC link(s) on {tp_short}...")
+
+    for item in existing:
+        link_id = item.get("id", "")
+
+        # Strategy 1: use relationships.workItem.data.id (most reliable)
+        rel_id = (item.get("relationships", {})
+                      .get("workItem", {})
+                      .get("data", {})
+                      .get("id", ""))
+        if rel_id:
+            target_short_id = updater._extract_short_id(rel_id)
+        else:
+            # Strategy 2: parse from link ID — target is second-to-last segment
+            # (format varies but role is always last, target always before it)
+            parts = link_id.split("/")
+            if len(parts) >= 3:
+                target_short_id = parts[-2]
+            else:
+                print(f"        ? Could not parse link ID: {link_id}")
+                foreign_links.append(item)
+                continue
+
+        # Fetch TC title
+        url = f"{updater.base_url}/projects/{updater.project_id}/workitems/{target_short_id}"
+        params = {"fields[workitems]": "title"}
+        resp = updater.session.get(url, params=params, verify=updater.verify_ssl)
+        if resp.status_code != 200:
+            print(f"        ? Could not fetch {target_short_id} (HTTP {resp.status_code}) — treating as foreign")
+            foreign_links.append(item)
+            continue
+
+        title = resp.json().get("data", {}).get("attributes", {}).get("title", "")
+
+        if title.startswith(prefix):
+            same_function_names.add(title)
+            same_function_links.append(item)
+            if verbose:
+                print(f"        ✓ {target_short_id} - {title}")
+        else:
+            foreign_links.append(item)
+            foreign_names.add(title)
+            print(f"        ↳ foreign: {target_short_id} - {title}")
+
+    print(f"      Classified: {len(same_function_links)} same-function, {len(foreign_links)} foreign")
+
+    return same_function_names, same_function_links, foreign_links, foreign_names
+
+
 def _delete_linked_work_item(
     updater: PolarionSourceLinkUpdater,
     tp_wi_id: str,
@@ -1059,33 +1359,62 @@ def link_test_cases_to_tp(
     tc_cache: Dict[str, Optional[str]],
     dry_run: bool = True,
     verbose: bool = False,
-) -> int:
+    _resolved: Optional[Tuple[set, List[Dict], List[Dict], set]] = None,
+) -> Tuple[int, bool]:
     """
     Link test cases found in the tp file to the given TP work item.
-    Returns count of TCs successfully linked.
+    Preserves foreign TC links (those belonging to other functions).
+
+    Returns (count of TCs linked, whether TC links were already aligned).
+    Pass _resolved to reuse a prior _resolve_existing_tc_links() result.
     """
     if not tp_file.tc_names:
-        return 0
+        return 0, True
 
     tp_short = updater._extract_short_id(tp_wi_id)
     print(f"    TC linking for {tp_short}:")
     print(f"      Found {len(tp_file.tc_names)} TC reference(s) in file")
 
+    # Classify existing TC links as same-function or foreign
+    if tp_wi_id == "DRY_RUN":
+        # Newly created WI in dry_run mode — no existing links
+        same_function_names, same_function_links, foreign_links, foreign_names = set(), [], [], set()
+    elif _resolved is not None:
+        same_function_names, same_function_links, foreign_links, foreign_names = _resolved
+    else:
+        same_function_names, same_function_links, foreign_links, foreign_names = _resolve_existing_tc_links(
+            updater, tp_wi_id, tp_file.test_name, verbose
+        )
+
+    desired_names = set(tp_file.tc_names)
+
+    # Check alignment
+    if same_function_names == desired_names:
+        print(f"      ✓ TC links already aligned ({len(desired_names)} TCs"
+              + (f", {len(foreign_links)} foreign preserved" if foreign_links else "")
+              + ")")
+        return 0, True
+
+    # Not aligned — show what differs
+    to_add = desired_names - same_function_names
+    to_remove = same_function_names - desired_names
+    if to_add:
+        print(f"      TC(s) to add:    {sorted(to_add)}")
+    if to_remove:
+        print(f"      TC(s) to remove: {sorted(to_remove)}")
+
     linked_count = 0
 
-    # Remove all existing TC links from TP first (preserves TR links)
+    # Delete only same-function TC links (preserve foreign)
     if not dry_run:
-        existing = _get_existing_tc_links(updater, tp_wi_id, verbose)
-        if existing and verbose:
-            print(f"      Deleting {len(existing)} existing TC link(s) from TP {tp_short}:")
-            for link in existing:
-                link_id = link.get("id", "?")
-                role = link.get("attributes", {}).get("role", "?")
-                print(f"        - {link_id} (role: {role})")
-        for link in existing:
-            _delete_linked_work_item(updater, tp_wi_id, link, verbose)
+        if same_function_links:
+            print(f"      Deleting {len(same_function_links)} of the function TC link(s)...")
+            for link in same_function_links:
+                _delete_linked_work_item(updater, tp_wi_id, link, verbose)
     else:
-        print(f"      [DRY RUN] Would remove existing TC links from TP {tp_short} (preserving TR links)")
+        print(f"      [DRY RUN] Would remove {len(same_function_links)} of the function TC link(s)"
+              + (f", preserve {len(foreign_links)} foreign" if foreign_links else "")
+              + ")")
 
     for tc_name in tp_file.tc_names:
         tc_wi_id = find_tc_work_item(updater, tc_name, tc_cache, verbose)
@@ -1107,7 +1436,7 @@ def link_test_cases_to_tp(
         else:
             print(f"      ✗ Failed to link TP {tp_short} → TC {tc_short} ({tc_name})")
 
-    return linked_count
+    return linked_count, False
 
 
 # ---------------------------------------------------------------------------
@@ -1337,14 +1666,9 @@ Examples:
         help="Skip creating new work items, only update existing ones",
     )
     parser.add_argument(
-        "--include-srvc",
-        action="store_true",
-        help="Also parse TC names from testCases_Srvc arrays (by default only testCases_Init is parsed)",
-    )
-    parser.add_argument(
         "--component-glob",
-        default="SBL_BOOT_APP0*",
-        help="Glob pattern for component directories under native/ or SFORD_POS/ (default: SBL_BOOT_APP0*). "
+        required=True,
+        help="Glob pattern for component directories under native/ or SFORD_POS/ (e.g. SBL_BOOT_APP0*). "
              "If the glob starts with POSBSP, searches under SFORD_POS/; otherwise under native/.",
     )
     parser.add_argument(
@@ -1417,30 +1741,31 @@ Examples:
 
     dry_run = not args.execute
 
-    print("=" * 60)
+    print("=" * 180)
     if dry_run:
         print("DRY RUN MODE - No changes will be made")
     else:
         print("EXECUTE MODE - Changes will be applied!")
-    print("=" * 60)
+    print("=" * 180)
+    print("\nLoading...", end="", flush=True)
 
     # Phase 0: Resolve branch
     ccr_id = args.ccr_id  # may be None if --branch was used
+    print("\r" + " " * 30 + "\r", end="", flush=True)
     if args.branch:
         branch_name = args.branch
-        print(f"\nPhase 0: Using branch '{branch_name}' (provided directly)")
+        print(f"Phase 0: Using branch '{branch_name}' (provided directly)")
     else:
-        print(f"\nPhase 0: Resolving CCR #{ccr_id} branch...")
+        print(f"Phase 0: Resolving CCR branch...")
         branch_name = resolve_ccr_branch(ccr_id, verbose=args.verbose)
 
     if use_remote:
-        # Remote mode: build gitlab_base URL with the resolved branch
-        # Parse host+project from the default/provided gitlab-base
-        parts = args.gitlab_base.split("/-/")
-        gitlab_repo_url = parts[0] if len(parts) >= 2 else args.gitlab_base
-        gitlab_base = f"{gitlab_repo_url}/-/blob/{branch_name}"
-        print(f"  Using remote mode (GitLab API) on branch '{branch_name}'")
-        print(f"  Source reference base: {gitlab_base}")
+        # Remote mode: files are fetched from the CCR/feature branch,
+        # but hyperlinks use --gitlab-base as-is (e.g. wassp-jenkins).
+        gitlab_base = args.gitlab_base
+        if args.verbose:
+            print(f"  [VERBOSE] Using remote mode (GitLab API) on branch '{branch_name}'")
+            print(f"  [VERBOSE] Source reference base: {gitlab_base}")
 
         gitlab_client = GitLabRepoClient(
             args.gitlab_base, gitlab_token,
@@ -1453,17 +1778,15 @@ Examples:
 
     # Phase 1: discover files
     if use_remote:
-        print(f"\nPhase 1: Discovering tp files via GitLab API (branch: {branch_name})")
         tp_files = discover_tp_files_remote(
             gitlab_client, branch_name,
-            include_srvc=args.include_srvc, verbose=args.verbose,
+            verbose=args.verbose,
             component_glob=args.component_glob,
             component_override=args.component,
         )
     else:
-        print(f"\nPhase 1: Discovering tp files in {repo_path}")
         tp_files = discover_tp_files(
-            repo_path, include_srvc=args.include_srvc, verbose=args.verbose,
+            repo_path, verbose=args.verbose,
             component_glob=args.component_glob,
             component_override=args.component,
         )
@@ -1471,22 +1794,23 @@ Examples:
         print("No tp files found. Nothing to do.")
         return
 
-    # Print discovery summary
     by_variant: Dict[str, List[TpFileInfo]] = {}
     for f in tp_files:
-        by_variant.setdefault(f"{f.boot_app_variant}/{f.test_type}", []).append(f)
+        by_variant.setdefault(f"{f.variant}/{f.test_type}", []).append(f)
 
-    print(f"\nDiscovered {len(tp_files)} tp file(s) across {len(by_variant)} folder(s):")
-    for key in sorted(by_variant.keys()):
-        files = by_variant[key]
-        print(f"  {key}: {len(files)} file(s)")
-        for f in files:
-            tc_count = len(f.tc_names)
-            tc_info = f" [{tc_count} TC(s)]" if tc_count else ""
-            print(f"    - {f.tp_filename} (test: {f.test_name}){tc_info}")
+    print(f"Phase 1: Discovered {len(tp_files)} TP file(s) across {len(by_variant)} folder(s)")
+
+    if args.verbose:
+        for key in sorted(by_variant.keys()):
+            files = by_variant[key]
+            print(f"  {key}: {len(files)} file(s)")
+            for f in files:
+                tc_count = len(f.tc_names)
+                tc_info = f" [{tc_count} TC(s)]" if tc_count else ""
+                print(f"    - {f.tp_filename} (test: {f.test_name}){tc_info}")
 
     # Phase 2: match against Polarion
-    print(f"\nPhase 2: Querying Polarion for existing work items...")
+    print(f"Phase 2: Querying Polarion for existing work items...")
     updater = PolarionSourceLinkUpdater(
         base_url, pat, project_id,
         verify_ssl=args.verify_ssl,
@@ -1494,57 +1818,109 @@ Examples:
     )
     match_result = match_files_to_work_items(tp_files, updater, verbose=args.verbose)
 
-    print(f"\nMatching results:")
-    print(f"  Work items to update: {len(match_result.updates)}")
-    print(f"  Work items to create: {len(match_result.creates)}")
+    # Identify multi-file groups (for showing variant in Resolved Mappings and Change Log)
+    _group_counts: Dict[str, int] = {}
+    for f in tp_files:
+        _group_counts[f.group_key] = _group_counts.get(f.group_key, 0) + 1
+    multi_file_groups = {k for k, v in _group_counts.items() if v > 1}
 
-    # --- Change log (grouped by function) ---
-    entries_by_group: Dict[str, List[str]] = {}
+    # --- Resolved Mappings and Polarion Work Items (printed immediately after matching) ---
+    info_by_group: Dict[str, List[str]] = {}
     for wi_id, wi_title, tp_file in match_result.updates:
         short_id = updater._extract_short_id(wi_id)
         tl_url, tp_url = build_gitlab_urls(tp_file, gitlab_base)
-        lines = [f"  [WOULD UPDATE] {short_id} - {wi_title}"]
-        for tc_name in tp_file.tc_names:
-            lines.append(f"      [implements] {tc_name}")
+        lines = [f"  {short_id} - {wi_title}"]
+        if tp_file.group_key in multi_file_groups:
+            lines.append(f"          \u21b3 {tp_file.variant}")
         lines.append("")
+        # Fetch linked TC titles and current hyperlinks to show alignment
+        prefix = f"{tp_file.test_name}_"
+        all_tc_titles = _fetch_linked_tc_titles(updater, wi_id)
+        foreign_tc_names = sorted(t for t in all_tc_titles if not t.startswith(prefix))
+        # Fetch current hyperlink URIs for alignment check
+        fetch_url = f"{updater.base_url}/projects/{updater.project_id}/workitems/{short_id}"
+        fetch_resp = updater.session.get(
+            fetch_url, params={"fields[workitems]": "hyperlinks"},
+            verify=updater.verify_ssl,
+        )
+        current_uris: set = set()
+        if fetch_resp.status_code == 200:
+            current_links = fetch_resp.json().get("data", {}).get("attributes", {}).get("hyperlinks", [])
+            current_uris = {link.get("uri", "") for link in current_links}
+        if tp_file.tc_names:
+            for tc_name in tp_file.tc_names:
+                if tc_name in all_tc_titles:
+                    lines.append(f"      \u2713 [implements] {tc_name}")
+                else:
+                    lines.append(f"      \u2717 [implements] {tc_name}")
+        if foreign_tc_names:
+            for tc_name in foreign_tc_names:
+                lines.append(f"      \u2713 [implements] {tc_name}  (foreign)")
+        if tp_file.tc_names or foreign_tc_names:
+            lines.append("")
         if tl_url:
-            lines.append(f"      [source reference] {tl_url}")
-        lines.append(f"      [source reference] {tp_url}")
-        entries_by_group.setdefault(tp_file.group_key, []).append("\n".join(lines))
+            mark = "\u2713" if tl_url in current_uris else "\u2717"
+            lines.append(f"      {mark} [source reference] {tl_url}")
+        tp_mark = "\u2713" if tp_url in current_uris else "\u2717"
+        lines.append(f"      {tp_mark} [source reference] {tp_url}")
+        info_by_group.setdefault(tp_file.group_key, []).append("\n".join(lines))
 
     for number, tp_file in match_result.creates:
         title = f"{tp_file.test_name}_{tp_file.test_type}_{number}"
         tl_url, tp_url = build_gitlab_urls(tp_file, gitlab_base)
-        lines = [f"  [WOULD CREATE] {title}"]
-        for tc_name in tp_file.tc_names:
-            lines.append(f"      [implements] {tc_name}")
+        lines = [f"  (new) {title}"]
+        if tp_file.group_key in multi_file_groups:
+            lines.append(f"          \u21b3 {tp_file.variant}")
         lines.append("")
+        if tp_file.tc_names:
+            for tc_name in tp_file.tc_names:
+                lines.append(f"      [implements] {tc_name}")
+            lines.append("")
         if tl_url:
             lines.append(f"      [source reference] {tl_url}")
         lines.append(f"      [source reference] {tp_url}")
-        entries_by_group.setdefault(tp_file.group_key, []).append("\n".join(lines))
+        info_by_group.setdefault(tp_file.group_key, []).append("\n".join(lines))
 
-    if entries_by_group:
-        print(f"\n{'=' * 60}")
-        print("Change Log")
-        print("=" * 60)
-        first_group = True
-        for group_key in sorted(entries_by_group.keys()):
-            if not first_group:
-                print("  " + "-" * 40)
-            first_group = False
-            group_entries = entries_by_group[group_key]
-            for i, entry in enumerate(group_entries):
-                print(entry)
-                if i < len(group_entries) - 1:
-                    print()
+    # Build a Polarion query showing all TP work item titles in this run
+    all_tp_titles = []
+    for wi_id, wi_title, tp_file in match_result.updates:
+        all_tp_titles.append(wi_title)
+    for number, tp_file in match_result.creates:
+        all_tp_titles.append(f"{tp_file.test_name}_{tp_file.test_type}_{number}")
+    if all_tp_titles:
+        title_query = " OR ".join(f"title:{t}" for t in all_tp_titles)
+        polarion_query = f"type:wi_testProcedure AND ({title_query})"
+        query_len = max(len(polarion_query), 80)
+        print(f"\n{'*' * query_len}")
+        print(f"(!) Paste Query below in the Polarion search to compare with the TPs fetched from CCR more easily :)")
+        print(f"{polarion_query}")
+        print(f"{'*' * query_len}")
+
+    branch_label = f"CCR #{ccr_id} ({branch_name})" if ccr_id else branch_name
+    print(f"\n{'=' * 180}")
+    print(f"Resolved Mappings from {branch_label} and Polarion Work Items")
+    print("=" * 180)
+    first_group = True
+    for group_key in sorted(info_by_group.keys()):
+        if not first_group:
+            print()
+            print("  " + "-" * 120)
+        first_group = False
+        entries = info_by_group[group_key]
+        for i, entry in enumerate(entries):
+            print()
+            print(entry)
+            if i < len(entries) - 1:
+                print()
 
     # Phase 3: update existing work items
     updated_ok = 0
     updated_fail = 0
+    aligned_count = 0
     items_processed = 0
     tc_linked_total = 0
     tc_cache: Dict[str, Optional[str]] = {}
+    change_entries_by_group: Dict[str, List[str]] = {}
     limit = args.limit
     if match_result.updates and not args.skip_updates:
         print(f"\nPhase 3: Updating existing work items...")
@@ -1552,19 +1928,120 @@ Examples:
             if limit and items_processed >= limit:
                 print(f"  Limit of {limit} reached, stopping.")
                 break
-            if update_existing_work_item(
+
+            short_id = updater._extract_short_id(wi_id)
+
+            # Step 1: Check and apply WI attribute changes
+            result = update_existing_work_item(
                 updater, wi_id, wi_title, tp_file,
                 gitlab_base, ccr_id,
                 component=args.component, category=args.category,
                 dry_run=dry_run, verbose=args.verbose,
-            ):
-                updated_ok += 1
-                # Link TCs to this TP (TP is still in rework)
-                tc_linked_total += link_test_cases_to_tp(
-                    updater, wi_id, tp_file, tc_cache,
-                    dry_run=dry_run, verbose=args.verbose,
+            )
+            success, wi_changes, wi_current_uris = result[0], result[1], result[2]
+
+            if not success:
+                updated_fail += 1
+                items_processed += 1
+                continue
+
+            # Step 2: Pre-resolve TC alignment (avoid double fetch)
+            if tp_file.tc_names and wi_id != "DRY_RUN":
+                resolved = _resolve_existing_tc_links(
+                    updater, wi_id, tp_file.test_name, args.verbose
                 )
-                # Now set TP to in_review
+                same_names = resolved[0]
+                tc_will_change = same_names != set(tp_file.tc_names)
+            else:
+                resolved = None
+                tc_will_change = bool(tp_file.tc_names)
+
+            # Step 3: If only TC links need changes (WI attrs aligned),
+            # ensure rework status before modifying links
+            if tc_will_change and not wi_changes and not dry_run:
+                fetch_url = f"{updater.base_url}/projects/{updater.project_id}/workitems/{short_id}"
+                fetch_resp = updater.session.get(
+                    fetch_url, params={"fields[workitems]": "status"},
+                    verify=updater.verify_ssl,
+                )
+                if fetch_resp.status_code == 200:
+                    cur_st = fetch_resp.json().get("data", {}).get("attributes", {}).get("status", "")
+                    if cur_st != "rework":
+                        print(f"    Setting status to 'rework' for TC link changes...")
+                        updater.update_work_item_status(wi_id, "rework", dry_run=False)
+            elif tc_will_change and not wi_changes and dry_run:
+                print(f"    [DRY RUN] Would change status to 'rework' for TC link changes")
+
+            # Step 4: Apply TC link changes (passing pre-resolved data)
+            tc_count, tc_aligned = link_test_cases_to_tp(
+                updater, wi_id, tp_file, tc_cache,
+                dry_run=dry_run, verbose=args.verbose,
+                _resolved=resolved,
+            )
+            tc_linked_total += tc_count
+
+            # Determine overall alignment
+            fully_aligned = not wi_changes and tc_aligned
+
+            if fully_aligned:
+                aligned_count += 1
+                foreign_count = len(resolved[3]) if resolved and resolved[3] else 0
+                tc_summary = f"{len(tp_file.tc_names)} TCs"
+                if foreign_count:
+                    tc_summary += f", {foreign_count} foreign"
+                lines = [f"  [ALIGNED] {short_id} - {wi_title}"]
+                if tp_file.group_key in multi_file_groups:
+                    lines.append(f"          \u21b3 {tp_file.variant}")
+                lines.append(f"      TCs already aligned ({tc_summary}) \u2713")
+                lines.append(f"      Source references already aligned \u2713")
+                if ccr_id:
+                    lines.append(f"      Internal reference already aligned \u2713")
+                change_entries_by_group.setdefault(tp_file.group_key, []).append("\n".join(lines))
+            else:
+                updated_ok += 1
+                tl_url, tp_url = build_gitlab_urls(tp_file, gitlab_base)
+                tag = "[WOULD UPDATE]" if dry_run else "[UPDATED]"
+                lines = [f"  {tag} {short_id} - {wi_title}"]
+                if tp_file.group_key in multi_file_groups:
+                    lines.append(f"          \u21b3 {tp_file.variant}")
+                if tc_aligned and tp_file.tc_names:
+                    foreign_count = len(resolved[3]) if resolved and resolved[3] else 0
+                    tc_summary = f"{len(tp_file.tc_names)} TCs"
+                    if foreign_count:
+                        tc_summary += f", {foreign_count} foreign"
+                    lines.append(f"      TCs already aligned ({tc_summary}) \u2713")
+                else:
+                    same_names = resolved[0] if resolved else set()
+                    for tc_name in tp_file.tc_names:
+                        if tc_name in same_names:
+                            lines.append(f"      \u2713 [implements] {tc_name}")
+                        elif tc_cache.get(tc_name) is None:
+                            lines.append(f"      \u26a0 [implements] {tc_name}  Work Item not found in Polarion - check TC name in TP file or Polarion")
+                        else:
+                            lines.append(f"      [+] [implements] {tc_name}  Currently missing - will be added")
+                    if resolved and resolved[3]:
+                        for tc_name in sorted(resolved[3]):
+                            lines.append(f"      \u2713 [implements] {tc_name}  (foreign)")
+                lines.append("")
+                src_aligned = (tp_url in wi_current_uris and
+                               (not tl_url or tl_url in wi_current_uris))
+                if src_aligned:
+                    lines.append(f"      Source references already aligned \u2713")
+                else:
+                    if tl_url:
+                        mark = "\u2713" if tl_url in wi_current_uris else "[+]"
+                        lines.append(f"      {mark} [source reference] {tl_url}")
+                    tp_mark = "\u2713" if tp_url in wi_current_uris else "[+]"
+                    lines.append(f"      {tp_mark} [source reference] {tp_url}")
+                if ccr_id:
+                    ccr_url = build_ccr_url(ccr_id)
+                    if ccr_url in wi_current_uris:
+                        lines.append(f"      Internal reference already aligned \u2713")
+                    else:
+                        lines.append(f"      [+] [internal reference] {ccr_url}")
+                change_entries_by_group.setdefault(tp_file.group_key, []).append("\n".join(lines))
+
+                # Status → in_review (only when changes were/would be made)
                 if not dry_run:
                     print(f"    Changing TP status to 'in_review'...")
                     if updater.update_work_item_status(wi_id, "in_review", dry_run=False):
@@ -1573,8 +2050,7 @@ Examples:
                         print(f"    ⚠ Failed to change TP status to 'in_review'")
                 else:
                     print(f"    [DRY RUN] Would change TP status to 'in_review'")
-            else:
-                updated_fail += 1
+
             items_processed += 1
 
     # Phase 4: create new work items
@@ -1596,10 +2072,11 @@ Examples:
             if created_id:
                 created_ok += 1
                 # Link TCs to this TP (TP is still in rework)
-                tc_linked_total += link_test_cases_to_tp(
+                tc_count, tc_aligned = link_test_cases_to_tp(
                     updater, created_id, tp_file, tc_cache,
                     dry_run=dry_run, verbose=args.verbose,
                 )
+                tc_linked_total += tc_count
                 # Now set TP to in_review
                 if not dry_run and created_id != "DRY_RUN":
                     print(f"    Changing TP status to 'in_review'...")
@@ -1609,26 +2086,62 @@ Examples:
                         print(f"    ⚠ Failed to change TP status to 'in_review'")
                 elif dry_run:
                     print(f"    [DRY RUN] Would change TP status to 'in_review'")
+
+                # Accumulate change log entry
+                title = f"{tp_file.test_name}_{tp_file.test_type}_{number}"
+                tl_url, tp_url = build_gitlab_urls(tp_file, gitlab_base)
+                tag = "[WOULD CREATE]" if dry_run else "[CREATED]"
+                lines = [f"  {tag} {title}"]
+                if tp_file.group_key in multi_file_groups:
+                    lines.append(f"          \u21b3 {tp_file.variant}")
+                for tc_name in tp_file.tc_names:
+                    lines.append(f"      [+] [implements] {tc_name}")
+                lines.append("")
+                if tl_url:
+                    lines.append(f"      [+] [source reference] {tl_url}")
+                lines.append(f"      [+] [source reference] {tp_url}")
+                if ccr_id:
+                    ccr_url = build_ccr_url(ccr_id)
+                    lines.append(f"      [+] [internal reference] {ccr_url}")
+                change_entries_by_group.setdefault(tp_file.group_key, []).append("\n".join(lines))
             else:
                 created_fail += 1
             items_processed += 1
 
+    # --- Change Log (after all processing, with alignment info) ---
+    if change_entries_by_group:
+        print(f"\n{'=' * 180}")
+        print("Change Log")
+        print("=" * 180)
+        first_group = True
+        for group_key in sorted(change_entries_by_group.keys()):
+            if not first_group:
+                print("  " + "-" * 120)
+            first_group = False
+            group_entries = change_entries_by_group[group_key]
+            for i, entry in enumerate(group_entries):
+                print(entry)
+                if i < len(group_entries) - 1:
+                    print()
+
     # Summary
-    print(f"\n{'=' * 60}")
+    print(f"\n{'=' * 180}")
     print("Summary:")
     print(f"  Files discovered: {len(tp_files)}")
     print(f"  Existing WIs matched: {len(match_result.updates)}")
     if dry_run:
+        print(f"    Already aligned: {aligned_count}")
         print(f"    Would update: {updated_ok}")
         print(f"  New WIs to create: {len(match_result.creates)}")
         print(f"    Would create: {created_ok}")
         print(f"  TC links: {tc_linked_total}")
         print(f"\nThis was a DRY RUN. Use --execute to apply changes.")
     else:
+        print(f"    Already aligned: {aligned_count}")
         print(f"    Updated OK: {updated_ok}, Failed: {updated_fail}")
         print(f"  New WIs created: {created_ok}, Failed: {created_fail}")
         print(f"  TC links created: {tc_linked_total}")
-    print(f"{'=' * 60}")
+    print(f"{'=' * 180}")
 
 if __name__ == "__main__":
     main()
