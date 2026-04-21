@@ -3,5 +3,4 @@
 - rename scripts
 
 - TPUpdater:
-    - when an internal reference has a p1 version of codecolab it should ot try to add the non p1 version of the link
-    - add 'not deleted' to query that is in the log
+    - Check if "Same as" TC links (i.e.: links foreign to the function of the TP work item) are correct, and add/remove as needed.
