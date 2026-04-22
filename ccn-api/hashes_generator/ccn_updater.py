@@ -9,6 +9,7 @@ will be modified.
 
 Modification History
 --------------------
+15apr26,tal Fixed fetching of files from CCR 
 15apr26,pse  Added fall back logic for previous hash lookup: if no older CCR has a commit for a file, use the oldest commit on the current CCR's branch. 
 15apr26,tal  Added --bsp/--bl modes, WASSP_PATH env var, 4000-char field guard. Change --update-first-only to --update-most-recent for clarity. 
 09mar26,tal  Added fixed path for --config file
@@ -99,27 +100,107 @@ def shorten_path(path):
     return "/".join(parts[-3:])
 
 
+def _has_code_files(filenames):
+    """Return True if any filename looks like test-procedure/test-logic code
+    (tl_*/tp_*), which distinguishes 'code' directories from auxiliary ones
+    (Makefiles, config/cdf/vm/ldra/vpx files, etc.)."""
+    for name in filenames:
+        base = name.rsplit("/", 1)[-1]
+        if base.startswith("tl_") or base.startswith("tp_"):
+            return True
+    return False
+
+
+def _classify_dirs(dir_to_filenames):
+    """Split directories into (aux_dirs, code_dirs), each sorted alphabetically.
+
+    A directory is classified as 'code' if it either contains tl_*/tp_* files
+    directly or is an ancestor of a directory that does (so higher-level
+    Makefile-only folders travel with the code they belong to).  Everything
+    else is 'aux' (cdf/, ldra/, vpx*/, vm/, hv/, etc.).
+    """
+    code_dirs = set()
+    for d, filenames in dir_to_filenames.items():
+        if _has_code_files(filenames):
+            code_dirs.add(d)
+    # Promote ancestors of code directories into the code tier.
+    for d in list(dir_to_filenames.keys()):
+        if d in code_dirs:
+            continue
+        prefix = d + "/" if d else ""
+        for cd in list(code_dirs):
+            if prefix and cd.startswith(prefix):
+                code_dirs.add(d)
+                break
+
+    aux = sorted(d for d in dir_to_filenames if d not in code_dirs)
+    code = sorted(d for d in dir_to_filenames if d in code_dirs)
+    return aux, code
+
+
 def group_by_directory(entries):
     """Group (shortened_path, value) pairs by directory.
 
-    Returns a string with files grouped under their directory header,
-    separated by blank lines.  Each entry is "filename - value".
+    Returns a string where each line is "dir/filename - value" (full path
+    kept on every line, like group_paths_by_directory).  Files in the same
+    directory are listed together (sorted); different directories are
+    separated by a blank line.  Auxiliary directories come first, then
+    code directories (including their higher-level Makefile-only ancestors).
     """
     from collections import OrderedDict
-    groups = OrderedDict()
+    groups = OrderedDict()       # directory -> list[str] ("dir/file - val")
+    filenames_by_dir = {}        # directory -> list[str] (raw filenames)
     for short_path, val in entries:
-        parts = short_path.replace("\\", "/").rsplit("/", 1)
+        normalized = short_path.replace("\\", "/")
+        parts = normalized.rsplit("/", 1)
         if len(parts) == 2:
             directory, filename = parts
         else:
             directory, filename = "", parts[0]
-        groups.setdefault(directory, []).append("{} - {}".format(filename, val))
+        groups.setdefault(directory, []).append("{} - {}".format(normalized, val))
+        filenames_by_dir.setdefault(directory, []).append(filename)
+
+    aux_dirs, code_dirs = _classify_dirs(filenames_by_dir)
 
     blocks = []
-    for directory, lines in groups.items():
-        lines.sort()
-        block = directory + "\n" + "\n".join(lines) if directory else "\n".join(lines)
-        blocks.append(block)
+    for directory in aux_dirs + code_dirs:
+        lines = sorted(groups[directory])
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
+def group_paths_by_directory(paths):
+    """Group shortened paths by directory, keeping full dir/file on each line.
+
+    Files in the same directory are listed together (sorted); different
+    directories are separated by a blank line.  No standalone directory
+    header is printed — the directory prefix stays on each line.
+
+    Directory groups are ordered so that auxiliary directories (cdf/, ldra/,
+    vpx*/, vm/, hv/, etc.) come first, followed by code directories
+    (those containing tl_*/tp_* files) together with their higher-level
+    Makefile-only ancestors.  Within each tier, directories are sorted
+    alphabetically.
+    """
+    from collections import OrderedDict
+    groups = OrderedDict()
+    filenames_by_dir = {}
+    for short_path in paths:
+        normalized = short_path.replace("\\", "/")
+        parts = normalized.rsplit("/", 1)
+        if len(parts) == 2:
+            directory, filename = parts
+        else:
+            directory, filename = "", parts[0]
+        groups.setdefault(directory, []).append(normalized)
+        filenames_by_dir.setdefault(directory, []).append(filename)
+
+    aux_dirs, code_dirs = _classify_dirs(filenames_by_dir)
+
+    blocks = []
+    for directory in aux_dirs + code_dirs:
+        lines = sorted(groups[directory])
+        blocks.append("\n".join(lines))
     return "\n\n".join(blocks)
 
 
@@ -372,6 +453,13 @@ for REVIEW_ID in REVIEW_IDS:
             changelist = mat.get("consolidatedChangelist", {})
             for f in changelist.get("reviewSummaryFiles", []):
                 path = f.get("path", "")
+                # Skip files that were reverted/removed from the current
+                # Materials tab (e.g. rebased-away uploads still visible in chat).
+                change_type = str(f.get("changeType", "")).upper()
+                if change_type == "REVERTED":
+                    if DEBUG:
+                        print("[DEBUG]       Skipping REVERTED file: {}".format(path))
+                    continue
                 if path:
                     review_files.append(path)
 
@@ -491,6 +579,8 @@ for idx, entry in enumerate(ccr_data):
     # =========================================================================
 
     # Build "Ending Version(s)" from latest-change hashes
+    if DEBUG:
+        print("[DEBUG] ---------- Ending Version(s) ----------")
     ending_entries = []
     for fh in file_hashes:
         display = format_path(fh["path"], MODE)
@@ -508,6 +598,8 @@ for idx, entry in enumerate(ccr_data):
         print("[DEBUG] Ending Version(s) value:\n{}".format(ending_value))
 
     # Build "Starting Version(s)" from previous-change hashes
+    if DEBUG:
+        print("[DEBUG] ---------- Starting Version(s) ----------")
     starting_entries = []
     for fh in file_hashes:
         display = format_path(fh["path"], MODE)
@@ -525,6 +617,8 @@ for idx, entry in enumerate(ccr_data):
         print("[DEBUG] Starting Version(s) value:\n{}".format(starting_value))
 
     # Build "Artifact ID(s)" from file paths
+    if DEBUG:
+        print("[DEBUG] ---------- Artifact ID(s) ----------")
     artifact_lines = []
     for fh in file_hashes:
         display = format_path(fh["path"], MODE)
@@ -532,9 +626,14 @@ for idx, entry in enumerate(ccr_data):
             print("[DEBUG] Artifact: '{}' -> '{}'".format(fh["path"], display))
         artifact_lines.append(display)
     if artifact_lines:
-        artifact_value = "\n".join(sorted(artifact_lines) if MODE == "bl" else artifact_lines)
+        if MODE == "bsp":
+            artifact_value = group_paths_by_directory(artifact_lines)
+        else:
+            artifact_value = "\n".join(sorted(artifact_lines))
     else:
         artifact_value = ""
+    if DEBUG:
+        print("[DEBUG] Artifact ID(s) value:\n{}".format(artifact_value))
 
     # Merge config fields with the dynamically generated fields
     dynamic_overrides = {
@@ -593,8 +692,18 @@ for idx, entry in enumerate(ccr_data):
 
     if DRY_RUN:
         print("[DRY RUN] Would update review #{}:".format(REVIEW_ID))
+        separator = "  " + "-" * 78
         for mf in merged_fields:
-            print("  {} -> {}".format(mf["name"], mf["value"][0]))
+            print(separator)
+            print("  {}".format(mf["name"]))
+            print(separator)
+            value = mf["value"][0]
+            if "\n" in value:
+                for line in value.split("\n"):
+                    print("    {}".format(line))
+            else:
+                print("    {}".format(value))
+        print(separator)
     else:
         resp4 = session.post(BASE_URL, json=update_req, verify=False)
         update_data = resp4.json()
