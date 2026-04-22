@@ -1762,6 +1762,10 @@ Examples:
         print("Don't forget to run  \"source ~/.bashrc\" after updating your environment variables. :p")
         sys.exit(1)
 
+    if args.dry_run and args.execute:
+        parser.error("--dry-run and --execute are mutually exclusive.")
+        
+    # Default is dry-run; --execute flips it. --dry-run is accepted as an explicit opt-in.
     dry_run = not args.execute
 
     print("=" * 180)
