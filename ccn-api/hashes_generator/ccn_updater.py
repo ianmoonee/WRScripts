@@ -9,9 +9,10 @@ will be modified.
 
 Modification History
 --------------------
-15apr26,tal Fixed fetching of files from CCR 
-15apr26,pse  Added fall back logic for previous hash lookup: if no older CCR has a commit for a file, use the oldest commit on the current CCR's branch. 
-15apr26,tal  Added --bsp/--bl modes, WASSP_PATH env var, 4000-char field guard. Change --update-first-only to --update-most-recent for clarity. 
+23apr26,tal  Added --component option for standardized overflow file naming.
+15apr26,tal Fixed fetching of files from CCR
+15apr26,pse  Added fall back logic for previous hash lookup: if no older CCR has a commit for a file, use the oldest commit on the current CCR's branch.
+15apr26,tal  Added --bsp/--bl modes, WASSP_PATH env var, 4000-char field guard. Change --update-first-only to --update-most-recent for clarity.
 09mar26,tal  Added fixed path for --config file
 06mar26,tal  General improvements:added --update-first-only option; added debug output; improved error handling and messages.
 05mar26,tal  Added support for multiple review IDs, with branch name and file list with hash for each.
@@ -35,6 +36,7 @@ Usage:
     python ccn_updater.py --review-id 31859 31280 --bsp --update-most-recent
     python ccn_updater.py --review-id 31859 --bl --dry-run
     python ccn_updater.py --review-id 31859 --bsp --debug
+    python ccn_updater.py --review-id 31859 --bsp --component SSD_NVME0
 
 Arguments:
     --help               Show usage information and exit.
@@ -43,6 +45,8 @@ Arguments:
     --bl                 BL mode: use full file paths in a flat sorted list.
     --config             Path to a JSON file with custom field values to set.
                          (optional — defaults to fields.json in the script directory)
+    --component          Component name for overflow file naming (e.g. SSD_NVME0).
+                         Required when any field exceeds 4000 characters.
     --update-most-recent Only update the newest (first) review; use the rest
                          only for previous-hash lookups.
     --dry-run            Validate only, do not apply changes.
@@ -63,12 +67,13 @@ API Reference:
     JSON API endpoint: https://ccn-codecolab.wrs.com:8443/services/json/v1
 """
 
-import requests
+import argparse
 import json
 import os
 import re
-import argparse
 import subprocess
+
+import requests
 import urllib3
 
 # Suppress SSL/TLS InsecureRequestWarning messages
@@ -87,7 +92,7 @@ def shorten_path(path):
     cert_tests_prefix = "helix/guests/vxworks-7/pkgs_v2/test/shallowford-cert-tests/"
     if cert_tests_prefix in normalized:
         idx = normalized.index(cert_tests_prefix)
-        return normalized[idx + len(cert_tests_prefix):]
+        return normalized[idx + len(cert_tests_prefix) :]
 
     ldra_prefix = "ldra/"
     if ldra_prefix in normalized:
@@ -148,8 +153,9 @@ def group_by_directory(entries):
     code directories (including their higher-level Makefile-only ancestors).
     """
     from collections import OrderedDict
-    groups = OrderedDict()       # directory -> list[str] ("dir/file - val")
-    filenames_by_dir = {}        # directory -> list[str] (raw filenames)
+
+    groups = OrderedDict()  # directory -> list[str] ("dir/file - val")
+    filenames_by_dir = {}  # directory -> list[str] (raw filenames)
     for short_path, val in entries:
         normalized = short_path.replace("\\", "/")
         parts = normalized.rsplit("/", 1)
@@ -183,6 +189,7 @@ def group_paths_by_directory(paths):
     alphabetically.
     """
     from collections import OrderedDict
+
     groups = OrderedDict()
     filenames_by_dir = {}
     for short_path in paths:
@@ -215,6 +222,22 @@ def format_path(path, mode):
     return path.replace("\\", "/")
 
 
+_DYNAMIC_FIELD_SUFFIXES = {
+    "Artifact ID(s)": "artifact-ids",
+    "Starting Version(s)": "starting-versions",
+    "Ending Version(s)": "ending-versions",
+}
+
+
+def _overflow_filename(mode, component, review_id, field_name):
+    """Build a standardized filename for an oversized CCR field."""
+    mode_label = "BSP" if mode == "bsp" else "SBL"
+    suffix = _DYNAMIC_FIELD_SUFFIXES[field_name]
+    return "Wind_River_Shallowford_{}_-_{}_-_TPS_formal-review-CCR{}-{}.txt".format(
+        mode_label, component, review_id, suffix
+    )
+
+
 def build_help_epilog():
     """Return the epilog text for --help output."""
     return """\
@@ -235,6 +258,7 @@ examples:
   python ccn_updater.py --review-id 31859 31280 --bsp --update-most-recent
   python ccn_updater.py --review-id 31859 --bl --dry-run
   python ccn_updater.py --review-id 31859 --bsp --debug
+  python ccn_updater.py --review-id 31859 --bsp --component SSD_NVME0
 
 config file format (include only the fields you want to update):
   {
@@ -251,21 +275,50 @@ config file format (include only the fields you want to update):
 parser = argparse.ArgumentParser(
     description="Update custom fields on a Collaborator review.",
     formatter_class=argparse.RawDescriptionHelpFormatter,
-    epilog=build_help_epilog())
-parser.add_argument("--review-id", type=int, nargs="+", required=True, help="One or more numeric IDs of the reviews to update.")
+    epilog=build_help_epilog(),
+)
+parser.add_argument(
+    "--review-id",
+    type=int,
+    nargs="+",
+    required=True,
+    help="One or more numeric IDs of the reviews to update.",
+)
 mode_group = parser.add_mutually_exclusive_group(required=True)
-mode_group.add_argument("--bsp", action="store_true", help="BSP mode: use shortened file paths grouped by directory.")
-mode_group.add_argument("--bl", action="store_true", help="BL mode: use full file paths in a flat sorted list.")
-parser.add_argument("--config", type=str, default=None, help="Path to JSON file with custom field values (default: fields.json in the script directory).")
-parser.add_argument("--dry-run", action="store_true", help="Validate the review without applying changes.")
+mode_group.add_argument(
+    "--bsp", action="store_true", help="BSP mode: use shortened file paths grouped by directory."
+)
+mode_group.add_argument(
+    "--bl", action="store_true", help="BL mode: use full file paths in a flat sorted list."
+)
+parser.add_argument(
+    "--config",
+    type=str,
+    default=None,
+    help="Path to JSON file with custom field values (default: fields.json in the script directory).",
+)
+parser.add_argument(
+    "--dry-run", action="store_true", help="Validate the review without applying changes."
+)
 parser.add_argument("--debug", action="store_true", help="Enable verbose debug output.")
-parser.add_argument("--update-most-recent", action="store_true", help="Only update the newest (most recent) review; use the rest only for previous-hash lookups.")
+parser.add_argument(
+    "--update-most-recent",
+    action="store_true",
+    help="Only update the newest (most recent) review; use the rest only for previous-hash lookups.",
+)
+parser.add_argument(
+    "--component",
+    type=str,
+    default=None,
+    help="Component name for overflow file naming (e.g. SSD_NVME0). Required when any field exceeds 4000 characters.",
+)
 args = parser.parse_args()
 
 DRY_RUN = args.dry_run
 DEBUG = args.debug
 UPDATE_MOST_RECENT = args.update_most_recent
 MODE = "bsp" if args.bsp else "bl"
+COMPONENT = args.component
 REVIEW_IDS = sorted(args.review_id, reverse=True)
 
 # --- Resolve config file path ---
@@ -287,10 +340,7 @@ if not isinstance(field_values, dict) or not field_values:
     exit(1)
 
 # Build the customFields payload from the config file
-CUSTOM_FIELDS = [
-    {"name": name, "value": [val]}
-    for name, val in field_values.items()
-]
+CUSTOM_FIELDS = [{"name": name, "value": [val]} for name, val in field_values.items()]
 
 # --- API configuration and credential validation ---
 BASE_URL = "https://ccn-codecolab.wrs.com:8443/services/json/v1"
@@ -298,16 +348,22 @@ CCN_LOGIN = os.environ.get("CCN_LOGIN")
 CCN_PASSWORD = os.environ.get("CCN_PASSWORD")
 
 if not CCN_LOGIN:
-    raise ValueError("CCN_LOGIN environment variable is not set, set it with 'export CCN_LOGIN=\"your_username\"' \
-                     (Linux) or '$env:CCN_LOGIN = \"your_username\"' (PowerShell)")
+    raise ValueError(
+        "CCN_LOGIN environment variable is not set, set it with 'export CCN_LOGIN=\"your_username\"' \
+                     (Linux) or '$env:CCN_LOGIN = \"your_username\"' (PowerShell)"
+    )
 if not CCN_PASSWORD:
-    raise ValueError("CCN_PASSWORD environment variable is not set, set it with 'export CCN_PASSWORD=\"your_password\"' \
-                     (Linux) or '$env:CCN_PASSWORD = \"your_password\"' (PowerShell)")
+    raise ValueError(
+        "CCN_PASSWORD environment variable is not set, set it with 'export CCN_PASSWORD=\"your_password\"' \
+                     (Linux) or '$env:CCN_PASSWORD = \"your_password\"' (PowerShell)"
+    )
 
 WASSP_PATH = os.environ.get("WASSP_PATH")
 if not WASSP_PATH:
-    raise ValueError("WASSP_PATH environment variable is not set, set it with 'export WASSP_PATH=\"/path/to/wassp\"' \
-                     (Linux) or '$env:WASSP_PATH = \"C:\\path\\to\\wassp\"' (PowerShell)")
+    raise ValueError(
+        "WASSP_PATH environment variable is not set, set it with 'export WASSP_PATH=\"/path/to/wassp\"' \
+                     (Linux) or '$env:WASSP_PATH = \"C:\\path\\to\\wassp\"' (PowerShell)"
+    )
 if not os.path.isdir(WASSP_PATH):
     raise ValueError("WASSP_PATH '{}' is not a valid directory".format(WASSP_PATH))
 
@@ -318,7 +374,9 @@ session = requests.Session()
 # Ensures local tracking refs are up to date before any git log lookups.
 # =========================================================================
 try:
-    subprocess.check_output(["git", "fetch", "--all", "--prune"], stderr=subprocess.PIPE, text=True, cwd=WASSP_PATH)
+    subprocess.check_output(
+        ["git", "fetch", "--all", "--prune"], stderr=subprocess.PIPE, text=True, cwd=WASSP_PATH
+    )
     if DEBUG:
         print("[DEBUG] git fetch --all --prune succeeded")
 except subprocess.CalledProcessError as e:
@@ -332,21 +390,18 @@ except subprocess.CalledProcessError as e:
 login_req = [
     {
         "command": "SessionService.getLoginTicket",
-        "args": {
-            "login": CCN_LOGIN,
-            "password": CCN_PASSWORD
-        }
+        "args": {"login": CCN_LOGIN, "password": CCN_PASSWORD},
     }
 ]
 
 resp = session.post(BASE_URL, json=login_req, verify=False)
 data = resp.json()
 
-#if DEBUG:
+# if DEBUG:
 #    print("[DEBUG] LoginTicket response:", json.dumps(data, indent=4))
 
 login_ticket = data[0]["result"]["loginTicket"]
-#if DEBUG:
+# if DEBUG:
 #    print("[DEBUG] Extracted loginTicket:", login_ticket)
 
 # =========================================================================
@@ -357,22 +412,13 @@ login_ticket = data[0]["result"]["loginTicket"]
 ccr_data = []  # ordered list matching REVIEW_IDS (descending / newest first)
 
 for REVIEW_ID in REVIEW_IDS:
-
     # --- Authenticate and validate the review ---
     validate_req = [
         {
             "command": "SessionService.authenticate",
-            "args": {
-                "login": CCN_LOGIN,
-                "ticket": login_ticket
-            }
+            "args": {"login": CCN_LOGIN, "ticket": login_ticket},
         },
-        {
-            "command": "ReviewService.findReviewById",
-            "args": {
-                "reviewId": REVIEW_ID
-            }
-        }
+        {"command": "ReviewService.findReviewById", "args": {"reviewId": REVIEW_ID}},
     ]
 
     resp2 = session.post(BASE_URL, json=validate_req, verify=False)
@@ -380,74 +426,80 @@ for REVIEW_ID in REVIEW_IDS:
 
     # Verify authentication succeeded
     if "errors" in validate_data[0]:
-        #print("Authentication failed:", validate_data[0]["errors"])
+        # print("Authentication failed:", validate_data[0]["errors"])
         exit(1)
-    #if DEBUG:
+    # if DEBUG:
     #    print("[DEBUG] Authentication successful")
 
     # Verify the review was found
     if "errors" in validate_data[1]:
-        #print("Review #{} not found: {}".format(REVIEW_ID, validate_data[1]["errors"]))
+        # print("Review #{} not found: {}".format(REVIEW_ID, validate_data[1]["errors"]))
         ccr_data.append({"review_id": REVIEW_ID, "branch": None, "files": []})
         continue
 
     review = validate_data[1].get("result", {})
 
     if not review:
-        #print("Review #{} not found".format(REVIEW_ID))
+        # print("Review #{} not found".format(REVIEW_ID))
         ccr_data.append({"review_id": REVIEW_ID, "branch": None, "files": []})
         continue
 
-    #print("Review #{} found: {}".format(REVIEW_ID, review.get("title", "N/A")))
+    # print("Review #{} found: {}".format(REVIEW_ID, review.get("title", "N/A")))
 
     # Display current vs new values for each field being updated
-    #current_fields = {f["name"]: f.get("value", ["N/A"]) for f in review.get("customFields", [])}
-    #for entry in CUSTOM_FIELDS:
+    # current_fields = {f["name"]: f.get("value", ["N/A"]) for f in review.get("customFields", [])}
+    # for entry in CUSTOM_FIELDS:
     #    name = entry["name"]
     #    current = current_fields.get(name, ["N/A"])
     #    new_val = entry["value"]
     #    print("  {}: {} -> {}".format(name, current, new_val))
-    #if DEBUG:
+    # if DEBUG:
     #    print("[DEBUG] Full review data:", json.dumps(review, indent=4, default=str))
 
-    #print()
+    # print()
 
     # --- Fetch the review summary (files + branch name) ---
     summary_req = [
         {
             "command": "SessionService.authenticate",
-            "args": {
-                "login": CCN_LOGIN,
-                "ticket": login_ticket
-            }
+            "args": {"login": CCN_LOGIN, "ticket": login_ticket},
         },
         {
             "command": "ReviewService.getReviewSummary",
-            "args": {
-                "reviewId": REVIEW_ID,
-                "clientBuild": "14401"
-            }
-        }
+            "args": {"reviewId": REVIEW_ID, "clientBuild": "14401"},
+        },
     ]
     resp_sum = session.post(BASE_URL, json=summary_req, verify=False)
     summary_data = resp_sum.json()
 
     review_files = []
     if "errors" in summary_data[1]:
-        #print("WARNING: Failed to fetch review files:", summary_data[1].get("errors"))
+        # print("WARNING: Failed to fetch review files:", summary_data[1].get("errors"))
         pass
     else:
         summary = summary_data[1].get("result", {})
         if DEBUG:
-            print("[DEBUG] Review #{} summary top-level keys: {}".format(REVIEW_ID, list(summary.keys())))
+            print(
+                "[DEBUG] Review #{} summary top-level keys: {}".format(
+                    REVIEW_ID, list(summary.keys())
+                )
+            )
             for i, mat in enumerate(summary.get("scmMaterials", [])):
                 print("[DEBUG]   scmMaterials[{}] keys: {}".format(i, list(mat.keys())))
                 changelist = mat.get("consolidatedChangelist", {})
                 print("[DEBUG]     consolidatedChangelist keys: {}".format(list(changelist.keys())))
                 for j, f in enumerate(changelist.get("reviewSummaryFiles", [])):
-                    print("[DEBUG]       reviewSummaryFiles[{}] keys: {} -> {}".format(j, list(f.keys()), json.dumps(f, indent=8, default=str)))
+                    print(
+                        "[DEBUG]       reviewSummaryFiles[{}] keys: {} -> {}".format(
+                            j, list(f.keys()), json.dumps(f, indent=8, default=str)
+                        )
+                    )
                     if j >= 2:
-                        print("[DEBUG]       ... ({} more files)".format(len(changelist.get("reviewSummaryFiles", [])) - 3))
+                        print(
+                            "[DEBUG]       ... ({} more files)".format(
+                                len(changelist.get("reviewSummaryFiles", [])) - 3
+                            )
+                        )
                         break
         for mat in summary.get("scmMaterials", []):
             changelist = mat.get("consolidatedChangelist", {})
@@ -473,11 +525,7 @@ for REVIEW_ID in REVIEW_IDS:
         if len(parts) >= 2:
             branch_name = parts[1]
 
-    ccr_data.append({
-        "review_id": REVIEW_ID,
-        "branch": branch_name,
-        "files": review_files
-    })
+    ccr_data.append({"review_id": REVIEW_ID, "branch": branch_name, "files": review_files})
 
 # =========================================================================
 # SECOND PASS — Look up git hashes and update reviews
@@ -495,19 +543,24 @@ for idx, entry in enumerate(ccr_data):
 
     # Collect hashes for all files first
     if DEBUG:
-        print("[DEBUG] Review #{}: branch='{}', {} files".format(REVIEW_ID, BRANCH_NAME, len(REVIEW_FILES)))
+        print(
+            "[DEBUG] Review #{}: branch='{}', {} files".format(
+                REVIEW_ID, BRANCH_NAME, len(REVIEW_FILES)
+            )
+        )
     file_hashes = []
     for fp in REVIEW_FILES:
         # Current hash: last commit on this CCR's branch
         current_hash = "N/A"
         if BRANCH_NAME:
             ref = "origin/" + BRANCH_NAME
-            cmd = ["git", "log", ref, "--no-merges", "-n", "1",
-                     "--pretty=format:%h", "--", fp]
+            cmd = ["git", "log", ref, "--no-merges", "-n", "1", "--pretty=format:%h", "--", fp]
             if DEBUG:
                 print("[DEBUG] cmd: {}".format(" ".join(cmd)))
             try:
-                out = subprocess.check_output(cmd, text=True, stderr=subprocess.PIPE, cwd=WASSP_PATH).strip()
+                out = subprocess.check_output(
+                    cmd, text=True, stderr=subprocess.PIPE, cwd=WASSP_PATH
+                ).strip()
                 if DEBUG:
                     print("[DEBUG] stdout: {!r}".format(out))
                 if out:
@@ -525,10 +578,11 @@ for idx, entry in enumerate(ccr_data):
             if not older_branch:
                 continue
             ref = "origin/" + older_branch
-            cmd = ["git", "log", ref, "--no-merges", "-n", "1",
-                     "--pretty=format:%h", "--", fp]
+            cmd = ["git", "log", ref, "--no-merges", "-n", "1", "--pretty=format:%h", "--", fp]
             try:
-                out = subprocess.check_output(cmd, text=True, stderr=subprocess.PIPE, cwd=WASSP_PATH).strip()
+                out = subprocess.check_output(
+                    cmd, text=True, stderr=subprocess.PIPE, cwd=WASSP_PATH
+                ).strip()
                 if out:
                     prev_hash = out
                     break
@@ -539,12 +593,13 @@ for idx, entry in enumerate(ccr_data):
         # use the oldest commit on the current CCR's own branch.
         if prev_hash == "N/A" and BRANCH_NAME:
             ref = "origin/" + BRANCH_NAME
-            cmd = ["git", "log", ref, "--no-merges",
-                     "--pretty=format:%h", "--", fp]
+            cmd = ["git", "log", ref, "--no-merges", "--pretty=format:%h", "--", fp]
             if DEBUG:
                 print("[DEBUG] prev_hash fallback cmd: {}".format(" ".join(cmd)))
             try:
-                out = subprocess.check_output(cmd, text=True, stderr=subprocess.PIPE, cwd=WASSP_PATH).strip()
+                out = subprocess.check_output(
+                    cmd, text=True, stderr=subprocess.PIPE, cwd=WASSP_PATH
+                ).strip()
                 if out:
                     prev_hash = out.splitlines()[-1]
                     if DEBUG:
@@ -556,19 +611,19 @@ for idx, entry in enumerate(ccr_data):
         file_hashes.append({"path": fp, "current": current_hash, "prev": prev_hash})
 
     # Print grouped output: header, latest change list, then previous change list
-    #print("===== CCR #{} - {} =====".format(REVIEW_ID, BRANCH_NAME if BRANCH_NAME else "N/A"))
+    # print("===== CCR #{} - {} =====".format(REVIEW_ID, BRANCH_NAME if BRANCH_NAME else "N/A"))
     #
-    #print("latest change")
-    #for fh in file_hashes:
+    # print("latest change")
+    # for fh in file_hashes:
     #    print("  {} - {}".format(fh["path"], fh["current"]))
     #
-    #if len(ccr_data) > 1:
+    # if len(ccr_data) > 1:
     #    print("")
     #    print("previous change")
     #    for fh in file_hashes:
     #        print("  {} - {}".format(fh["path"], fh["prev"]))
     #
-    #print("")
+    # print("")
 
     # =========================================================================
     # STEP 3 — Update the custom fields via ReviewService.editReview
@@ -654,18 +709,12 @@ for idx, entry in enumerate(ccr_data):
     update_req = [
         {
             "command": "SessionService.authenticate",
-            "args": {
-                "login": CCN_LOGIN,
-                "ticket": login_ticket
-            }
+            "args": {"login": CCN_LOGIN, "ticket": login_ticket},
         },
         {
             "command": "ReviewService.editReview",
-            "args": {
-                "reviewId": REVIEW_ID,
-                "customFields": merged_fields
-            }
-        }
+            "args": {"reviewId": REVIEW_ID, "customFields": merged_fields},
+        },
     ]
 
     # Skip update for non-first reviews when --update-most-recent is set
@@ -675,20 +724,46 @@ for idx, entry in enumerate(ccr_data):
         continue
 
     # --- 4000-char field guard ---
-    oversized = [(mf["name"], len(mf["value"][0])) for mf in merged_fields if len(mf["value"][0]) > 4000]
+    oversized = [
+        (mf["name"], len(mf["value"][0])) for mf in merged_fields if len(mf["value"][0]) > 4000
+    ]
     if oversized:
+        # Check for oversized non-dynamic fields (cannot be replaced with filenames)
+        non_dynamic_oversized = [n for n, _ in oversized if n not in _DYNAMIC_FIELD_SUFFIXES]
+        if non_dynamic_oversized:
+            print(
+                "ERROR: Non-dynamic field(s) exceed 4000 characters: {}".format(
+                    ", ".join(non_dynamic_oversized)
+                )
+            )
+            print("Skipping update for review #{}.".format(REVIEW_ID))
+            print()
+            continue
+
+        if not COMPONENT:
+            print("ERROR: Field(s) exceed 4000 characters but --component was not provided.")
+            for fname, flen in oversized:
+                print("  '{}': {} chars".format(fname, flen))
+            print("Re-run with --component <name> to generate overflow files.")
+            print()
+            continue
+
         results_dir = os.path.join(".", "{}_results".format(REVIEW_ID))
         os.makedirs(results_dir, exist_ok=True)
+
+        # Write all 3 dynamic fields to files and replace their values with filenames
         for mf in merged_fields:
-            safe_name = re.sub(r'[^\w]+', '_', mf["name"]).strip('_')
-            out_path = os.path.join(results_dir, "{}_{}.txt".format(REVIEW_ID, safe_name))
+            if mf["name"] not in _DYNAMIC_FIELD_SUFFIXES:
+                continue
+            fname = _overflow_filename(MODE, COMPONENT, REVIEW_ID, mf["name"])
+            out_path = os.path.join(results_dir, fname)
             with open(out_path, "w") as fout:
                 fout.write(mf["value"][0])
+            mf["value"] = [fname]
+
         for fname, flen in oversized:
             print("WARNING: Field '{}' exceeds 4000 characters ({} chars).".format(fname, flen))
-        print("Skipping update for review #{}. Field values written to {}".format(REVIEW_ID, results_dir))
-        print()
-        continue
+        print("Overflow files written to {}".format(results_dir))
 
     if DRY_RUN:
         print("[DRY RUN] Would update review #{}:".format(REVIEW_ID))
