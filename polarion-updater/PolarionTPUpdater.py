@@ -199,9 +199,15 @@ class GitLabRepoClient:
         return None
 
     def find_merged_mr_for_branch(
-        self, source_branch: str, target_branch: str = "wassp-jenkins"
+        self, source_branch: str, target_branch: str = "wassp-jenkins",
+        verbose: bool = False,
     ) -> Optional[Dict]:
-        """Return the latest merged MR for source->target branch, if any."""
+        """Return the latest merged MR for source->target branch, if any.
+
+        Returns None both when no merged MR exists and when the API call fails.
+        In the failure case, a warning is printed (with details in verbose mode)
+        so callers can distinguish 'not merged' from 'could not check'.
+        """
         url = f"{self.api_base}/projects/{self.project_id}/merge_requests"
         params = {
             "source_branch": source_branch,
@@ -211,8 +217,18 @@ class GitLabRepoClient:
             "sort": "desc",
             "per_page": 1,
         }
-        resp = self.session.get(url, params=params, verify=self.verify_ssl)
+        try:
+            resp = self.session.get(url, params=params, verify=self.verify_ssl)
+        except requests.RequestException as e:
+            print(f"  Warning: GitLab MR lookup failed for branch '{source_branch}' -> '{target_branch}': {e}")
+            return None
         if resp.status_code != 200:
+            print(
+                f"  Warning: GitLab MR lookup for branch '{source_branch}' -> '{target_branch}' "
+                f"returned HTTP {resp.status_code}; treating as 'not merged'."
+            )
+            if verbose:
+                print(f"    [VERBOSE] Response: {resp.text[:500]}")
             return None
         items = resp.json()
         if isinstance(items, list) and items:
@@ -1825,7 +1841,9 @@ Examples:
         if gitlab_client is None:
             print("Phase 0: Could not verify MR merge state (GITLAB_TOKEN missing); CCR internal references remain enabled.")
         else:
-            mr = gitlab_client.find_merged_mr_for_branch(branch_name, target_branch="wassp-jenkins")
+            mr = gitlab_client.find_merged_mr_for_branch(
+                branch_name, target_branch="wassp-jenkins", verbose=args.verbose,
+            )
             if mr:
                 mr_iid = mr.get("iid", "?")
                 merged_mr_iid = str(mr_iid)
@@ -1991,7 +2009,9 @@ Examples:
         if tl_url:
             lines.append(f"      [source reference] {tl_url}")
         lines.append(f"      [source reference] {tp_url}")
-        if ccr_id and merged_mr_iid:
+        if effective_ccr_id:
+            lines.append(f"      [internal reference] CCR #{effective_ccr_id}")
+        elif ccr_id and merged_mr_iid:
             lines.append(f"      [~] [internal reference] skipped \u2014 branch already merged (MR !{merged_mr_iid})")
         info_by_group.setdefault(tp_file.test_name, []).append(
             ((tp_file.test_type, number), "\n".join(lines))
