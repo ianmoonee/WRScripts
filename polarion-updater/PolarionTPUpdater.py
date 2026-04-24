@@ -198,6 +198,27 @@ class GitLabRepoClient:
             return resp.text
         return None
 
+    def find_merged_mr_for_branch(
+        self, source_branch: str, target_branch: str = "wassp-jenkins"
+    ) -> Optional[Dict]:
+        """Return the latest merged MR for source->target branch, if any."""
+        url = f"{self.api_base}/projects/{self.project_id}/merge_requests"
+        params = {
+            "source_branch": source_branch,
+            "target_branch": target_branch,
+            "state": "merged",
+            "order_by": "updated_at",
+            "sort": "desc",
+            "per_page": 1,
+        }
+        resp = self.session.get(url, params=params, verify=self.verify_ssl)
+        if resp.status_code != 200:
+            return None
+        items = resp.json()
+        if isinstance(items, list) and items:
+            return items[0]
+        return None
+
 
 # ---------------------------------------------------------------------------
 # Data Classes
@@ -1786,6 +1807,54 @@ Examples:
         print(f"Phase 0: Resolving CCR branch...")
         branch_name = resolve_ccr_branch(ccr_id, verbose=args.verbose)
 
+    # CCR internal-reference handling is disabled automatically if this branch
+    # is already merged to wassp-jenkins (additional commits on wassp-jenkins
+    # would no longer correspond to this CCR).
+    effective_ccr_id: Optional[str] = ccr_id
+    ccr_links_disabled_reason: Optional[str] = None
+
+    gitlab_client: Optional[GitLabRepoClient] = None
+    if use_remote or (ccr_id and gitlab_token):
+        gitlab_client = GitLabRepoClient(
+            args.gitlab_base, gitlab_token,
+            verify_ssl=args.verify_ssl,
+        )
+
+    merged_mr_iid: Optional[str] = None
+    if ccr_id:
+        if gitlab_client is None:
+            print("Phase 0: Could not verify MR merge state (GITLAB_TOKEN missing); CCR internal references remain enabled.")
+        else:
+            mr = gitlab_client.find_merged_mr_for_branch(branch_name, target_branch="wassp-jenkins")
+            if mr:
+                mr_iid = mr.get("iid", "?")
+                merged_mr_iid = str(mr_iid)
+                effective_ccr_id = None
+                ccr_links_disabled_reason = (
+                    f"Branch '{branch_name}' is already merged to 'wassp-jenkins' "
+                    f"(MR !{mr_iid}); CCR internal references will be ignored."
+                )
+                _banner_lines = [
+                    f"BRANCH ALREADY MERGED TO wassp-jenkins  (CCR #{ccr_id}, MR !{mr_iid})",
+                    "CCR internal references will NOT be added, checked, or updated.",
+                    "Any additional commits on wassp-jenkins no longer correspond to this CCR.",
+                ]
+                _banner_width = max(max(len(l) for l in _banner_lines) + 8, 80)
+                print()
+                print("\n\n\n\n")
+                print("!" * _banner_width)
+                print("!!" + " WARNING ".center(_banner_width - 4, "!") + "!!")
+                for _ln in _banner_lines:
+                    print("!!  " + _ln.ljust(_banner_width - 8) + "  !!")
+                print("!" * _banner_width)
+                print()
+                print("\n\n\n\n")
+            elif args.verbose:
+                print(
+                    f"  [VERBOSE] Branch '{branch_name}' is not merged to 'wassp-jenkins' "
+                    "(or no merged MR found); CCR internal references enabled."
+                )
+
     if use_remote:
         # Remote mode: files are fetched from the CCR/feature branch,
         # but hyperlinks use --gitlab-base as-is (e.g. wassp-jenkins).
@@ -1793,11 +1862,9 @@ Examples:
         if args.verbose:
             print(f"  [VERBOSE] Using remote mode (GitLab API) on branch '{branch_name}'")
             print(f"  [VERBOSE] Source reference base: {gitlab_base}")
-
-        gitlab_client = GitLabRepoClient(
-            args.gitlab_base, gitlab_token,
-            verify_ssl=args.verify_ssl,
-        )
+        if gitlab_client is None:
+            print("Error: internal error - GitLab client was not initialized for remote mode")
+            sys.exit(1)
     else:
         # Local mode: checkout the branch
         gitlab_base = args.gitlab_base
@@ -1899,9 +1966,11 @@ Examples:
             lines.append(f"      {mark} [source reference] {tl_url}")
         tp_mark = "\u2713" if tp_url in current_uris else "\u2717"
         lines.append(f"      {tp_mark} [source reference] {tp_url}")
-        if ccr_id:
-            ccr_mark = "\u2713" if _has_ccr_link(current_uris, ccr_id) else "\u2717"
-            lines.append(f"      {ccr_mark} [internal reference] CCR #{ccr_id}")
+        if effective_ccr_id:
+            ccr_mark = "\u2713" if _has_ccr_link(current_uris, effective_ccr_id) else "\u2717"
+            lines.append(f"      {ccr_mark} [internal reference] CCR #{effective_ccr_id}")
+        elif ccr_id and merged_mr_iid:
+            lines.append(f"      [~] [internal reference] skipped \u2014 branch already merged (MR !{merged_mr_iid})")
         _m = re.search(r"_(\d+)$", wi_title)
         _num = int(_m.group(1)) if _m else 0
         info_by_group.setdefault(tp_file.test_name, []).append(
@@ -1922,6 +1991,8 @@ Examples:
         if tl_url:
             lines.append(f"      [source reference] {tl_url}")
         lines.append(f"      [source reference] {tp_url}")
+        if ccr_id and merged_mr_iid:
+            lines.append(f"      [~] [internal reference] skipped \u2014 branch already merged (MR !{merged_mr_iid})")
         info_by_group.setdefault(tp_file.test_name, []).append(
             ((tp_file.test_type, number), "\n".join(lines))
         )
@@ -1944,6 +2015,8 @@ Examples:
     branch_label = f"CCR #{ccr_id} ({branch_name})" if ccr_id else branch_name
     print(f"\n{'=' * 180}")
     print(f"Resolved Mappings from {branch_label} and Polarion Work Items")
+    if ccr_links_disabled_reason:
+        print(f"Note: {ccr_links_disabled_reason}")
     print("=" * 180)
     first_group = True
     for group_key in sorted(info_by_group.keys()):
@@ -1992,7 +2065,7 @@ Examples:
                 # Step 1: Check and apply WI attribute changes
                 result = update_existing_work_item(
                     updater, wi_id, wi_title, tp_file,
-                    gitlab_base, ccr_id,
+                    gitlab_base, effective_ccr_id,
                     component=args.component, category=args.category,
                     dry_run=dry_run, verbose=args.verbose,
                 )
@@ -2054,8 +2127,10 @@ Examples:
                         lines.append(f"          \u21b3 {tp_file.variant}")
                     lines.append(f"      TCs already aligned ({tc_summary}) \u2713")
                     lines.append(f"      Source references already aligned \u2713")
-                    if ccr_id:
+                    if effective_ccr_id:
                         lines.append(f"      Internal reference already aligned \u2713")
+                    elif ccr_id and merged_mr_iid:
+                        lines.append(f"      Internal reference skipped \u2014 branch already merged (MR !{merged_mr_iid})")
                     lines.append(f"      Component already aligned \u2713")
                     lines.append(f"      Category already aligned \u2713")
                     _m = re.search(r"_(\d+)$", wi_title)
@@ -2106,12 +2181,14 @@ Examples:
                             lines.append(f"      {mark} [source reference] {tl_url}")
                         tp_mark = "\u2713" if tp_url in wi_current_uris else "[+]"
                         lines.append(f"      {tp_mark} [source reference] {tp_url}")
-                    if ccr_id:
-                        ccr_url = build_ccr_url(ccr_id)
-                        if _has_ccr_link(wi_current_uris, ccr_id):
+                    if effective_ccr_id:
+                        ccr_url = build_ccr_url(effective_ccr_id)
+                        if _has_ccr_link(wi_current_uris, effective_ccr_id):
                             lines.append(f"      Internal reference already aligned \u2713")
                         else:
                             lines.append(f"      [+] [internal reference] {ccr_url}")
+                    elif ccr_id and merged_mr_iid:
+                        lines.append(f"      Internal reference skipped \u2014 branch already merged (MR !{merged_mr_iid})")
                     # Component alignment line
                     desired_component_str = f"comp_{args.component}"
                     if wi_current_component == desired_component_str:
@@ -2153,7 +2230,7 @@ Examples:
                 break
             created_id = create_new_work_item(
                 updater, number, tp_file,
-                gitlab_base, ccr_id,
+                gitlab_base, effective_ccr_id,
                 component=args.component, category=args.category,
                 author=args.author,
                 dry_run=dry_run, verbose=args.verbose,
@@ -2189,9 +2266,11 @@ Examples:
                 if tl_url:
                     lines.append(f"      [+] [source reference] {tl_url}")
                 lines.append(f"      [+] [source reference] {tp_url}")
-                if ccr_id:
-                    ccr_url = build_ccr_url(ccr_id)
+                if effective_ccr_id:
+                    ccr_url = build_ccr_url(effective_ccr_id)
                     lines.append(f"      [+] [internal reference] {ccr_url}")
+                elif ccr_id and merged_mr_iid:
+                    lines.append(f"      [~] [internal reference] skipped \u2014 branch already merged (MR !{merged_mr_iid})")
                 change_entries_by_group.setdefault(tp_file.test_name, []).append(
                     ((tp_file.test_type, number), "\n".join(lines))
                 )
