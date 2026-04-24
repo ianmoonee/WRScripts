@@ -205,8 +205,9 @@ class GitLabRepoClient:
         """Return the latest merged MR for source->target branch, if any.
 
         Returns None both when no merged MR exists and when the API call fails.
-        In the failure case, a warning is printed (with details in verbose mode)
-        so callers can distinguish 'not merged' from 'could not check'.
+        In the failure case, a warning is printed (with details in verbose mode),
+        but the return value does not distinguish 'not merged' from
+        'could not check'.
         """
         url = f"{self.api_base}/projects/{self.project_id}/merge_requests"
         params = {
@@ -230,7 +231,16 @@ class GitLabRepoClient:
             if verbose:
                 print(f"    [VERBOSE] Response: {resp.text[:500]}")
             return None
-        items = resp.json()
+        try:
+            items = resp.json()
+        except ValueError as e:
+            print(
+                f"  Warning: GitLab MR lookup for branch '{source_branch}' -> '{target_branch}' "
+                f"returned invalid JSON; treating as 'not merged': {e}"
+            )
+            if verbose:
+                print(f"    [VERBOSE] Response: {resp.text[:500]}")
+            return None
         if isinstance(items, list) and items:
             return items[0]
         return None
@@ -902,13 +912,16 @@ def update_existing_work_item(
     wi_title: str,
     tp_file: TpFileInfo,
     gitlab_base: str,
-    ccr_id: str,
+    ccr_id: Optional[str],
     component: str,
     category: str,
     dry_run: bool = True,
     verbose: bool = False,
 ) -> Tuple[bool, bool, set, str, str]:
     """Update an existing work item's hyperlinks, component, and category.
+
+    ``ccr_id`` may be ``None`` to disable CCR internal-reference handling
+    (e.g. when the branch is already merged to ``wassp-jenkins``).
 
     Returns (success, changes_needed, current_uris, current_component, current_category_id).
     """
@@ -1086,14 +1099,18 @@ def create_new_work_item(
     number: int,
     tp_file: TpFileInfo,
     gitlab_base: str,
-    ccr_id: str,
+    ccr_id: Optional[str],
     component: str,
     category: str,
     author: Optional[str] = None,
     dry_run: bool = True,
     verbose: bool = False,
 ) -> Optional[str]:
-    """Create a new test procedure work item. Returns the created WI ID, or None on failure."""
+    """Create a new test procedure work item. Returns the created WI ID, or None on failure.
+
+    ``ccr_id`` may be ``None`` to skip adding a CCR internal-reference hyperlink
+    (e.g. when the branch is already merged to ``wassp-jenkins``).
+    """
     title = f"{tp_file.test_name}_{tp_file.test_type}_{number}"
 
     # Build hyperlinks
