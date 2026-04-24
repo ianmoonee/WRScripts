@@ -5,3 +5,4 @@
 - TPUpdater:
     - Check if "Same as" TC links (i.e.: links foreign to the function of the TP work item) are correct, and add/remove as needed.
     - When a branch is already merged into wassp-jenkins the script shouldn't check for internal reference CCR links (how can it tell which CCR to link to? maybe should just ignore them at this point). If it is executed after merge it will mess up the internal reference links.
+        - Maybe check if branch is already merged from the Merge Request associated with the branch and gitlab API?
