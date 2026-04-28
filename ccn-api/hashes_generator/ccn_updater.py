@@ -35,6 +35,7 @@ Usage:
     python ccn_updater.py --review-id 31859 31280 --bsp --update-most-recent
     python ccn_updater.py --review-id 31859 --bl --dry-run
     python ccn_updater.py --review-id 31859 --bsp --debug
+    python ccn_updater.py --review-id 31859 --bsp --file-base "My_Project-formal-review"
 
 Arguments:
     --help               Show usage information and exit.
@@ -45,6 +46,10 @@ Arguments:
                          (optional — defaults to fields.json in the script directory)
     --update-most-recent Only update the newest (first) review; use the rest
                          only for previous-hash lookups.
+    --file-base          Base name for output .txt files.  The script appends
+                         -CCR<id>-<field-slug>.txt automatically.
+                         E.g. --file-base "My_Project-formal-review" produces
+                         My_Project-formal-review-CCR31387-artifact-ids.txt
     --dry-run            Validate only, do not apply changes.
     --debug              Enable verbose debug output.
 
@@ -215,6 +220,17 @@ def format_path(path, mode):
     return path.replace("\\", "/")
 
 
+def field_name_to_slug(name):
+    """Convert a field name to a kebab-case slug for use in filenames.
+
+    E.g. "Artifact ID(s)" -> "artifact-ids",
+         "Starting Version(s)" -> "starting-versions".
+    """
+    slug = name.replace("(s)", "s").lower()
+    slug = re.sub(r'[^a-z0-9]+', '-', slug)
+    return slug.strip('-')
+
+
 def build_help_epilog():
     """Return the epilog text for --help output."""
     return """\
@@ -235,6 +251,7 @@ examples:
   python ccn_updater.py --review-id 31859 31280 --bsp --update-most-recent
   python ccn_updater.py --review-id 31859 --bl --dry-run
   python ccn_updater.py --review-id 31859 --bsp --debug
+  python ccn_updater.py --review-id 31859 --bsp --file-base "My_Project-formal-review"
 
 config file format (include only the fields you want to update):
   {
@@ -260,11 +277,13 @@ parser.add_argument("--config", type=str, default=None, help="Path to JSON file 
 parser.add_argument("--dry-run", action="store_true", help="Validate the review without applying changes.")
 parser.add_argument("--debug", action="store_true", help="Enable verbose debug output.")
 parser.add_argument("--update-most-recent", action="store_true", help="Only update the newest (most recent) review; use the rest only for previous-hash lookups.")
+parser.add_argument("--file-base", type=str, default=None, help="Base name for output .txt files. The script appends -CCR<id>-<field-slug>.txt automatically.")
 args = parser.parse_args()
 
 DRY_RUN = args.dry_run
 DEBUG = args.debug
 UPDATE_MOST_RECENT = args.update_most_recent
+FILE_BASE = args.file_base
 MODE = "bsp" if args.bsp else "bl"
 REVIEW_IDS = sorted(args.review_id, reverse=True)
 
@@ -674,19 +693,35 @@ for idx, entry in enumerate(ccr_data):
             print("[DEBUG] Skipping update for review #{} (--update-most-recent)".format(REVIEW_ID))
         continue
 
-    # --- 4000-char field guard ---
-    oversized = [(mf["name"], len(mf["value"][0])) for mf in merged_fields if len(mf["value"][0]) > 4000]
-    if oversized:
+    # --- Write output files when --file-base is set ---
+    if FILE_BASE:
         results_dir = os.path.join(".", "{}_results".format(REVIEW_ID))
         os.makedirs(results_dir, exist_ok=True)
         for mf in merged_fields:
-            safe_name = re.sub(r'[^\w]+', '_', mf["name"]).strip('_')
-            out_path = os.path.join(results_dir, "{}_{}.txt".format(REVIEW_ID, safe_name))
+            slug = field_name_to_slug(mf["name"])
+            out_path = os.path.join(results_dir, "{}-CCR{}-{}.txt".format(FILE_BASE, REVIEW_ID, slug))
             with open(out_path, "w") as fout:
                 fout.write(mf["value"][0])
+            if DEBUG:
+                print("[DEBUG] Wrote {}".format(out_path))
+        print("Field values for review #{} written to {}".format(REVIEW_ID, results_dir))
+
+    # --- 4000-char field guard ---
+    oversized = [(mf["name"], len(mf["value"][0])) for mf in merged_fields if len(mf["value"][0]) > 4000]
+    if oversized:
+        if not FILE_BASE:
+            results_dir = os.path.join(".", "{}_results".format(REVIEW_ID))
+            os.makedirs(results_dir, exist_ok=True)
+            for mf in merged_fields:
+                safe_name = re.sub(r'[^\w]+', '_', mf["name"]).strip('_')
+                out_path = os.path.join(results_dir, "{}_{}.txt".format(REVIEW_ID, safe_name))
+                with open(out_path, "w") as fout:
+                    fout.write(mf["value"][0])
         for fname, flen in oversized:
             print("WARNING: Field '{}' exceeds 4000 characters ({} chars).".format(fname, flen))
-        print("Skipping update for review #{}. Field values written to {}".format(REVIEW_ID, results_dir))
+        print("Skipping update for review #{}.{}".format(
+            REVIEW_ID,
+            "" if FILE_BASE else " Field values written to {}".format(results_dir)))
         print()
         continue
 
