@@ -36,7 +36,7 @@ Usage:
     python ccn_updater.py --review-id 31859 31280 --bsp --update-most-recent
     python ccn_updater.py --review-id 31859 --bl --dry-run
     python ccn_updater.py --review-id 31859 --bsp --debug
-    python ccn_updater.py --review-id 31859 --bsp --component SSD_NVME0
+    python ccn_updater.py --review-id 31859 --bsp --file-base "My_Project-formal-review"
 
 Arguments:
     --help               Show usage information and exit.
@@ -49,6 +49,10 @@ Arguments:
                          Required when any field exceeds 4000 characters.
     --update-most-recent Only update the newest (first) review; use the rest
                          only for previous-hash lookups.
+    --file-base          Base name for output .txt files.  The script appends
+                         -CCR<id>-<field-slug>.txt automatically.
+                         E.g. --file-base "My_Project-formal-review" produces
+                         My_Project-formal-review-CCR31387-artifact-ids.txt
     --dry-run            Validate only, do not apply changes.
     --debug              Enable verbose debug output.
 
@@ -222,20 +226,15 @@ def format_path(path, mode):
     return path.replace("\\", "/")
 
 
-_DYNAMIC_FIELD_SUFFIXES = {
-    "Artifact ID(s)": "artifact-ids",
-    "Starting Version(s)": "starting-versions",
-    "Ending Version(s)": "ending-versions",
-}
+def field_name_to_slug(name):
+    """Convert a field name to a kebab-case slug for use in filenames.
 
-
-def _overflow_filename(mode, component, review_id, field_name):
-    """Build a standardized filename for an oversized CCR field."""
-    mode_label = "BSP" if mode == "bsp" else "SBL"
-    suffix = _DYNAMIC_FIELD_SUFFIXES[field_name]
-    return "Wind_River_Shallowford_{}_-_{}_-_TPS_formal-review-CCR{}-{}.txt".format(
-        mode_label, component, review_id, suffix
-    )
+    E.g. "Artifact ID(s)" -> "artifact-ids",
+         "Starting Version(s)" -> "starting-versions".
+    """
+    slug = name.replace("(s)", "s").lower()
+    slug = re.sub(r'[^a-z0-9]+', '-', slug)
+    return slug.strip('-')
 
 
 def build_help_epilog():
@@ -258,7 +257,7 @@ examples:
   python ccn_updater.py --review-id 31859 31280 --bsp --update-most-recent
   python ccn_updater.py --review-id 31859 --bl --dry-run
   python ccn_updater.py --review-id 31859 --bsp --debug
-  python ccn_updater.py --review-id 31859 --bsp --component SSD_NVME0
+  python ccn_updater.py --review-id 31859 --bsp --file-base "My_Project-formal-review"
 
 config file format (include only the fields you want to update):
   {
@@ -301,22 +300,14 @@ parser.add_argument(
     "--dry-run", action="store_true", help="Validate the review without applying changes."
 )
 parser.add_argument("--debug", action="store_true", help="Enable verbose debug output.")
-parser.add_argument(
-    "--update-most-recent",
-    action="store_true",
-    help="Only update the newest (most recent) review; use the rest only for previous-hash lookups.",
-)
-parser.add_argument(
-    "--component",
-    type=str,
-    default=None,
-    help="Component name for overflow file naming (e.g. SSD_NVME0). Required when any field exceeds 4000 characters.",
-)
+parser.add_argument("--update-most-recent", action="store_true", help="Only update the newest (most recent) review; use the rest only for previous-hash lookups.")
+parser.add_argument("--file-base", type=str, default=None, help="Base name for output .txt files. The script appends -CCR<id>-<field-slug>.txt automatically.")
 args = parser.parse_args()
 
 DRY_RUN = args.dry_run
 DEBUG = args.debug
 UPDATE_MOST_RECENT = args.update_most_recent
+FILE_BASE = args.file_base
 MODE = "bsp" if args.bsp else "bl"
 COMPONENT = args.component
 REVIEW_IDS = sorted(args.review_id, reverse=True)
@@ -723,47 +714,39 @@ for idx, entry in enumerate(ccr_data):
             print("[DEBUG] Skipping update for review #{} (--update-most-recent)".format(REVIEW_ID))
         continue
 
-    # --- 4000-char field guard ---
-    oversized = [
-        (mf["name"], len(mf["value"][0])) for mf in merged_fields if len(mf["value"][0]) > 4000
-    ]
-    if oversized:
-        # Check for oversized non-dynamic fields (cannot be replaced with filenames)
-        non_dynamic_oversized = [n for n, _ in oversized if n not in _DYNAMIC_FIELD_SUFFIXES]
-        if non_dynamic_oversized:
-            print(
-                "ERROR: Non-dynamic field(s) exceed 4000 characters: {}".format(
-                    ", ".join(non_dynamic_oversized)
-                )
-            )
-            print("Skipping update for review #{}.".format(REVIEW_ID))
-            print()
-            continue
-
-        if not COMPONENT:
-            print("ERROR: Field(s) exceed 4000 characters but --component was not provided.")
-            for fname, flen in oversized:
-                print("  '{}': {} chars".format(fname, flen))
-            print("Re-run with --component <name> to generate overflow files.")
-            print()
-            continue
-
+    # --- Write output files when --file-base is set ---
+    if FILE_BASE:
         results_dir = os.path.join(".", "{}_results".format(REVIEW_ID))
         os.makedirs(results_dir, exist_ok=True)
 
         # Write all 3 dynamic fields to files and replace their values with filenames
         for mf in merged_fields:
-            if mf["name"] not in _DYNAMIC_FIELD_SUFFIXES:
-                continue
-            fname = _overflow_filename(MODE, COMPONENT, REVIEW_ID, mf["name"])
-            out_path = os.path.join(results_dir, fname)
+            slug = field_name_to_slug(mf["name"])
+            out_path = os.path.join(results_dir, "{}-CCR{}-{}.txt".format(FILE_BASE, REVIEW_ID, slug))
             with open(out_path, "w") as fout:
                 fout.write(mf["value"][0])
-            mf["value"] = [fname]
+            if DEBUG:
+                print("[DEBUG] Wrote {}".format(out_path))
+        print("Field values for review #{} written to {}".format(REVIEW_ID, results_dir))
 
+    # --- 4000-char field guard ---
+    oversized = [(mf["name"], len(mf["value"][0])) for mf in merged_fields if len(mf["value"][0]) > 4000]
+    if oversized:
+        if not FILE_BASE:
+            results_dir = os.path.join(".", "{}_results".format(REVIEW_ID))
+            os.makedirs(results_dir, exist_ok=True)
+            for mf in merged_fields:
+                safe_name = re.sub(r'[^\w]+', '_', mf["name"]).strip('_')
+                out_path = os.path.join(results_dir, "{}_{}.txt".format(REVIEW_ID, safe_name))
+                with open(out_path, "w") as fout:
+                    fout.write(mf["value"][0])
         for fname, flen in oversized:
             print("WARNING: Field '{}' exceeds 4000 characters ({} chars).".format(fname, flen))
-        print("Overflow files written to {}".format(results_dir))
+        print("Skipping update for review #{}.{}".format(
+            REVIEW_ID,
+            "" if FILE_BASE else " Field values written to {}".format(results_dir)))
+        print()
+        continue
 
     if DRY_RUN:
         print("[DRY RUN] Would update review #{}:".format(REVIEW_ID))
