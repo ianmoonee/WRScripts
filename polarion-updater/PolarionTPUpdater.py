@@ -35,7 +35,7 @@ import subprocess
 import io
 import contextlib
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuple, Any
+from typing import List, Dict, Optional, Tuple, Any, NamedTuple, Set
 from urllib.parse import quote as url_quote, urlparse
 
 import requests
@@ -198,6 +198,53 @@ class GitLabRepoClient:
             return resp.text
         return None
 
+    def find_merged_mr_for_branch(
+        self, source_branch: str, target_branch: str = "wassp-jenkins",
+        verbose: bool = False,
+    ) -> Optional[Dict]:
+        """Return the latest merged MR for source->target branch, if any.
+
+        Returns None both when no merged MR exists and when the API call fails.
+        In the failure case, a warning is printed (with details in verbose mode),
+        but the return value does not distinguish 'not merged' from
+        'could not check'.
+        """
+        url = f"{self.api_base}/projects/{self.project_id}/merge_requests"
+        params = {
+            "source_branch": source_branch,
+            "target_branch": target_branch,
+            "state": "merged",
+            "order_by": "updated_at",
+            "sort": "desc",
+            "per_page": 1,
+        }
+        try:
+            resp = self.session.get(url, params=params, verify=self.verify_ssl)
+        except requests.RequestException as e:
+            print(f"  Warning: GitLab MR lookup failed for branch '{source_branch}' -> '{target_branch}': {e}")
+            return None
+        if resp.status_code != 200:
+            print(
+                f"  Warning: GitLab MR lookup for branch '{source_branch}' -> '{target_branch}' "
+                f"returned HTTP {resp.status_code}; treating as 'not merged'."
+            )
+            if verbose:
+                print(f"    [VERBOSE] Response: {resp.text[:500]}")
+            return None
+        try:
+            items = resp.json()
+        except ValueError as e:
+            print(
+                f"  Warning: GitLab MR lookup for branch '{source_branch}' -> '{target_branch}' "
+                f"returned invalid JSON; treating as 'not merged': {e}"
+            )
+            if verbose:
+                print(f"    [VERBOSE] Response: {resp.text[:500]}")
+            return None
+        if isinstance(items, list) and items:
+            return items[0]
+        return None
+
 
 # ---------------------------------------------------------------------------
 # Data Classes
@@ -220,6 +267,8 @@ class TpFileInfo:
 
     # Optional override for the Polarion component name
     component_override: Optional[str] = None
+    # Original test name before variant normalization (None if unchanged)
+    original_test_name: Optional[str] = None
 
     @property
     def group_key(self) -> str:
@@ -499,6 +548,23 @@ def discover_tp_files(repo_path: str, verbose: bool = False,
                     # Parse TC names from tp file comments
                     tc_names = parse_tc_names_from_file(tp_path, verbose)
 
+                    # Normalize a variant-suffixed filename (e.g. ..._II.c) to its
+                    # base family when all TCs use the base form — so Polarion
+                    # matching lands on the existing base family TPs instead of
+                    # proposing a spurious new '<name>_II_<TYPE>_1'.
+                    normalized_name, was_normalized = _normalize_variant_test_name(
+                        test_name, tc_names
+                    )
+                    original_name = None
+                    if was_normalized:
+                        original_name = test_name
+                        print(
+                            f"  [NOTE] Normalizing variant-suffixed test name "
+                            f"'{test_name}' \u2192 '{normalized_name}' for "
+                            f"{tp_basename} (all TCs use the base form)."
+                        )
+                        test_name = normalized_name
+
                     info = TpFileInfo(
                         tp_filename=tp_basename,
                         tl_filename=tl_filename,
@@ -509,6 +575,7 @@ def discover_tp_files(repo_path: str, verbose: bool = False,
                         rel_dir=rel_dir,
                         tc_names=tc_names,
                         component_override=component_override,
+                        original_test_name=original_name,
                     )
                     results.append(info)
 
@@ -621,6 +688,23 @@ def discover_tp_files_remote(
                     content = gitlab_client.get_file_content(tp_file_path, ref)
                     tc_names = parse_tc_names_from_content(content) if content else []
 
+                    # Normalize a variant-suffixed filename (e.g. ..._II.c) to its
+                    # base family when all TCs use the base form — so Polarion
+                    # matching lands on the existing base family TPs instead of
+                    # proposing a spurious new '<name>_II_<TYPE>_1'.
+                    normalized_name, was_normalized = _normalize_variant_test_name(
+                        test_name, tc_names
+                    )
+                    original_name = None
+                    if was_normalized:
+                        original_name = test_name
+                        print(
+                            f"  [NOTE] Normalizing variant-suffixed test name "
+                            f"'{test_name}' \u2192 '{normalized_name}' for "
+                            f"{tp_basename} (all TCs use the base form)."
+                        )
+                        test_name = normalized_name
+
                     info = TpFileInfo(
                         tp_filename=tp_basename,
                         tl_filename=tl_filename,
@@ -631,6 +715,7 @@ def discover_tp_files_remote(
                         rel_dir=rel_dir,
                         tc_names=tc_names,
                         component_override=component_override,
+                        original_test_name=original_name,
                     )
                     results.append(info)
 
@@ -865,13 +950,16 @@ def update_existing_work_item(
     wi_title: str,
     tp_file: TpFileInfo,
     gitlab_base: str,
-    ccr_id: str,
+    ccr_id: Optional[str],
     component: str,
     category: str,
     dry_run: bool = True,
     verbose: bool = False,
 ) -> Tuple[bool, bool, set, str, str]:
     """Update an existing work item's hyperlinks, component, and category.
+
+    ``ccr_id`` may be ``None`` to disable CCR internal-reference handling
+    (e.g. when the branch is already merged to ``wassp-jenkins``).
 
     Returns (success, changes_needed, current_uris, current_component, current_category_id).
     """
@@ -1049,14 +1137,18 @@ def create_new_work_item(
     number: int,
     tp_file: TpFileInfo,
     gitlab_base: str,
-    ccr_id: str,
+    ccr_id: Optional[str],
     component: str,
     category: str,
     author: Optional[str] = None,
     dry_run: bool = True,
     verbose: bool = False,
 ) -> Optional[str]:
-    """Create a new test procedure work item. Returns the created WI ID, or None on failure."""
+    """Create a new test procedure work item. Returns the created WI ID, or None on failure.
+
+    ``ccr_id`` may be ``None`` to skip adding a CCR internal-reference hyperlink
+    (e.g. when the branch is already merged to ``wassp-jenkins``).
+    """
     title = f"{tp_file.test_name}_{tp_file.test_type}_{number}"
 
     # Build hyperlinks
@@ -1182,6 +1274,117 @@ def find_tc_work_item(
     return None
 
 
+# Variant suffixes recognised on a TP's test_name. A TP file whose test_name is
+# e.g. ``nvmeXbdService_II`` may legitimately reference TCs from the same family
+# under the shorter ``nvmeXbdService_`` prefix (a "continuation" / batch-2 file).
+_VARIANT_SUFFIXES = (
+    "_II", "_III", "_IV", "_V", "_VI",
+    "_2", "_3", "_4", "_5", "_6", "_7", "_8", "_9",
+)
+
+
+def _strip_variant_suffix(test_name: str) -> Optional[str]:
+    """Return ``test_name`` with a trailing variant suffix stripped, or None.
+
+    Only strips when the suffix yields a non-empty base (so ``_II`` alone
+    wouldn't collapse to the empty string).
+    """
+    for suf in _VARIANT_SUFFIXES:
+        if test_name.endswith(suf) and len(test_name) > len(suf):
+            return test_name[: -len(suf)]
+    return None
+
+
+def _compute_effective_tc_prefix(
+    test_name: str, tc_names: List[str]
+) -> Tuple[str, bool]:
+    """Compute the effective same-function prefix for this TP.
+
+    Returns ``(effective_prefix, ambiguous)``:
+      * Outcome 1 (full-form, all TCs match ``test_name_``): full prefix, not ambiguous.
+      * Outcome 2 (variant file, all TCs match ``base_test_name_`` and none
+        match ``test_name_``): base prefix, not ambiguous.
+      * Outcome 3 (variant file with a **mix** of both forms): full prefix,
+        ambiguous=True (callers must skip TC reconciliation).
+      * Outcome 4 (any other / empty TC list): full prefix, not ambiguous.
+        Mis-named TCs in this case are surfaced later by the per-TC Polarion
+        lookup (``TC '…' not found in Polarion``).
+    """
+    full_prefix = f"{test_name}_"
+    if not tc_names:
+        return full_prefix, False
+
+    base = _strip_variant_suffix(test_name)
+    if base is None:
+        # No variant suffix → nothing special to do.
+        return full_prefix, False
+
+    base_prefix = f"{base}_"
+    has_full = any(tc.startswith(full_prefix) for tc in tc_names)
+    # A name that starts with full_prefix also starts with base_prefix; only
+    # count "base-form" names that do NOT already match the full form.
+    has_base_only = any(
+        tc.startswith(base_prefix) and not tc.startswith(full_prefix)
+        for tc in tc_names
+    )
+
+    if has_full and has_base_only:
+        return full_prefix, True  # ambiguous mix
+    if has_base_only and not has_full:
+        return base_prefix, False  # clean variant file
+    return full_prefix, False
+
+
+def _normalize_variant_test_name(
+    test_name: str, tc_names: List[str]
+) -> Tuple[str, bool]:
+    """Rewrite ``test_name`` to its base form when the file is a clean variant.
+
+    A tp file whose basename carries a variant suffix (e.g. ``_II``) but whose
+    TC references all use the **base** family name (e.g. ``nvmeXbdService_LLTC_*``
+    rather than ``nvmeXbdService_II_LLTC_*``) is treated as a continuation of
+    the base family. The suffix is stripped so Polarion matching lands on the
+    next free TP number of the base family (e.g. ``nvmeXbdService_LLTP_2``)
+    instead of proposing a spurious ``nvmeXbdService_II_LLTP_1``.
+
+    Only rewrites in the unambiguous "base-only TCs" case. Mixed-form files
+    keep the variant name and are flagged later as ambiguous in Phase 3.
+
+    Returns ``(effective_test_name, was_normalized)``.
+    """
+    base = _strip_variant_suffix(test_name)
+    if base is None or not tc_names:
+        return test_name, False
+    full_prefix = f"{test_name}_"
+    base_prefix = f"{base}_"
+    has_full = any(tc.startswith(full_prefix) for tc in tc_names)
+    has_base_only = any(
+        tc.startswith(base_prefix) and not tc.startswith(full_prefix)
+        for tc in tc_names
+    )
+    if has_base_only and not has_full:
+        return base, True
+    return test_name, False
+
+
+class TCResolution(NamedTuple):
+    """Classification of TC links already on a TP work item.
+
+    * ``already_linked_desired_names``: TC titles currently linked AND listed
+      in the TP file (no action needed).
+    * ``stale_links`` / ``stale_names``: TC links whose title matches the
+      effective same-function prefix but is NOT in the TP file — these are
+      candidates for deletion.
+    * ``foreign_links`` / ``foreign_names``: TC links that match neither the
+      desired set nor the same-function prefix — always preserved.
+    """
+    already_linked_desired_names: Set[str]
+    stale_links: List[Dict]
+    stale_names: Set[str]
+    foreign_links: List[Dict]
+    foreign_names: Set[str]
+
+
 def _get_existing_tc_links(
     updater: PolarionSourceLinkUpdater,
     tp_wi_id: str,
@@ -1240,26 +1443,30 @@ def _fetch_linked_tc_titles(
 def _resolve_existing_tc_links(
     updater: PolarionSourceLinkUpdater,
     tp_wi_id: str,
-    test_name: str,
+    effective_prefix: str,
+    desired_tc_names: Set[str],
     verbose: bool = False,
-) -> Tuple[set, List[Dict], List[Dict], set]:
+) -> TCResolution:
     """
-    Classify existing TC links on a TP as same-function or foreign.
+    Classify existing TC links on a TP into three buckets:
 
-    A TC is "same-function" if its title starts with '{test_name}_'.
-    Everything else is foreign (belongs to a different function's TP).
-
-    Returns (same_function_tc_names, same_function_links, foreign_links, foreign_tc_names).
+    * ``already_linked_desired_names``: title is in ``desired_tc_names``
+      (no action — already in sync).
+    * ``stale_links`` / ``stale_names``: title starts with ``effective_prefix``
+      but is NOT in ``desired_tc_names`` (same-function but removed from the TP
+      file — candidate for deletion).
+    * ``foreign_links`` / ``foreign_names``: everything else (different
+      function / "Same as" links — always preserved).
     """
     existing = _get_existing_tc_links(updater, tp_wi_id, verbose)
     if not existing:
-        return set(), [], [], set()
+        return TCResolution(set(), [], set(), [], set())
 
-    same_function_names: set = set()
-    same_function_links: List[Dict] = []
+    already_linked_desired_names: Set[str] = set()
+    stale_links: List[Dict] = []
+    stale_names: Set[str] = set()
     foreign_links: List[Dict] = []
-    foreign_names: set = set()
-    prefix = f"{test_name}_"
+    foreign_names: Set[str] = set()
 
     tp_short = updater._extract_short_id(tp_wi_id)
     print(f"      Resolving {len(existing)} existing TC link(s) on {tp_short}...")
@@ -1296,19 +1503,31 @@ def _resolve_existing_tc_links(
 
         title = resp.json().get("data", {}).get("attributes", {}).get("title", "")
 
-        if title.startswith(prefix):
-            same_function_names.add(title)
-            same_function_links.append(item)
+        if title in desired_tc_names:
+            already_linked_desired_names.add(title)
             if verbose:
-                print(f"        ✓ {target_short_id} - {title}")
+                print(f"        \u2713 {target_short_id} - {title} (already in TP file)")
+        elif title.startswith(effective_prefix):
+            stale_links.append(item)
+            stale_names.add(title)
+            print(f"        \u2717 stale: {target_short_id} - {title} (same-function, not in TP file)")
         else:
             foreign_links.append(item)
             foreign_names.add(title)
-            print(f"        ↳ foreign: {target_short_id} - {title}")
+            print(f"        \u21b3 foreign: {target_short_id} - {title}")
 
-    print(f"      Classified: {len(same_function_links)} same-function, {len(foreign_links)} foreign")
+    print(
+        f"      Classified: {len(already_linked_desired_names)} already aligned, "
+        f"{len(stale_links)} stale, {len(foreign_links)} foreign"
+    )
 
-    return same_function_names, same_function_links, foreign_links, foreign_names
+    return TCResolution(
+        already_linked_desired_names,
+        stale_links,
+        stale_names,
+        foreign_links,
+        foreign_names,
+    )
 
 
 def _delete_linked_work_item(
@@ -1383,14 +1602,20 @@ def link_test_cases_to_tp(
     tc_cache: Dict[str, Optional[str]],
     dry_run: bool = True,
     verbose: bool = False,
-    _resolved: Optional[Tuple[set, List[Dict], List[Dict], set]] = None,
+    effective_prefix: Optional[str] = None,
+    ambiguous: bool = False,
+    _resolved: Optional[TCResolution] = None,
 ) -> Tuple[int, bool]:
     """
     Link test cases found in the tp file to the given TP work item.
     Preserves foreign TC links (those belonging to other functions).
 
+    When ``ambiguous`` is True (mixed full-form + base-form TC references in a
+    variant file), TC reconciliation is SKIPPED entirely and the user is
+    warned loudly. Hyperlinks / component / category updates still proceed.
+
     Returns (count of TCs linked, whether TC links were already aligned).
-    Pass _resolved to reuse a prior _resolve_existing_tc_links() result.
+    Pass ``_resolved`` to reuse a prior ``_resolve_existing_tc_links()`` result.
     """
     if not tp_file.tc_names:
         return 0, True
@@ -1399,66 +1624,93 @@ def link_test_cases_to_tp(
     print(f"    TC linking for {tp_short}:")
     print(f"      Found {len(tp_file.tc_names)} TC reference(s) in file")
 
-    # Classify existing TC links as same-function or foreign
+    desired_names: Set[str] = set(tp_file.tc_names)
+
+    # Refuse to touch TC links when the file mixes full-form and base-form
+    # names — we cannot safely decide which form is "correct".
+    if ambiguous:
+        base = _strip_variant_suffix(tp_file.test_name)
+        full_prefix = f"{tp_file.test_name}_"
+        base_prefix = f"{base}_" if base else ""
+        full_form = sorted(n for n in desired_names if n.startswith(full_prefix))
+        base_form = sorted(
+            n for n in desired_names
+            if base_prefix and n.startswith(base_prefix) and not n.startswith(full_prefix)
+        )
+        print(f"      \u26a0\u26a0\u26a0 AMBIGUOUS TC NAMING — TC linking SKIPPED for this TP.")
+        print(f"      This variant-suffixed TP ('{tp_file.test_name}') references TCs in BOTH forms:")
+        print(f"        full-form ({full_prefix}*): {full_form}")
+        print(f"        base-form ({base_prefix}*): {base_form}")
+        print(f"      Fix the TP file to use a single consistent form, then re-run.")
+        # Report as "aligned" so the summary doesn't flip to REWORK purely on TCs;
+        # the warning above is the user-facing signal.
+        return 0, True
+
+    if effective_prefix is None:
+        effective_prefix = f"{tp_file.test_name}_"
+
+    # Classify existing TC links (already-linked / stale / foreign)
     if tp_wi_id == "DRY_RUN":
         # Newly created WI in dry_run mode — no existing links
-        same_function_names, same_function_links, foreign_links, foreign_names = set(), [], [], set()
+        resolved = TCResolution(set(), [], set(), [], set())
     elif _resolved is not None:
-        same_function_names, same_function_links, foreign_links, foreign_names = _resolved
+        resolved = _resolved
     else:
-        same_function_names, same_function_links, foreign_links, foreign_names = _resolve_existing_tc_links(
-            updater, tp_wi_id, tp_file.test_name, verbose
+        resolved = _resolve_existing_tc_links(
+            updater, tp_wi_id, effective_prefix, desired_names, verbose
         )
 
-    desired_names = set(tp_file.tc_names)
-
-    # Check alignment
-    if same_function_names == desired_names:
-        print(f"      ✓ TC links already aligned ({len(desired_names)} TCs"
-              + (f", {len(foreign_links)} foreign preserved" if foreign_links else "")
+    # Check alignment: nothing to add AND nothing stale to remove.
+    to_add = desired_names - resolved.already_linked_desired_names
+    if not to_add and not resolved.stale_links:
+        print(f"      \u2713 TC links already aligned ({len(desired_names)} TCs"
+              + (f", {len(resolved.foreign_links)} foreign preserved" if resolved.foreign_links else "")
               + ")")
         return 0, True
 
     # Not aligned — show what differs
-    to_add = desired_names - same_function_names
-    to_remove = same_function_names - desired_names
     if to_add:
         print(f"      TC(s) to add:    {sorted(to_add)}")
-    if to_remove:
-        print(f"      TC(s) to remove: {sorted(to_remove)}")
+    if resolved.stale_names:
+        print(f"      TC(s) to remove: {sorted(resolved.stale_names)}")
 
     linked_count = 0
 
-    # Delete only same-function TC links (preserve foreign)
+    # Delete only stale same-function TC links (preserve foreign + already-linked desired)
     if not dry_run:
-        if same_function_links:
-            print(f"      Deleting {len(same_function_links)} of the function TC link(s)...")
-            for link in same_function_links:
+        if resolved.stale_links:
+            print(f"      Deleting {len(resolved.stale_links)} stale same-function TC link(s)...")
+            for link in resolved.stale_links:
                 _delete_linked_work_item(updater, tp_wi_id, link, verbose)
     else:
-        print(f"      [DRY RUN] Would remove {len(same_function_links)} of the function TC link(s)"
-              + (f", preserve {len(foreign_links)} foreign" if foreign_links else "")
-              + ")")
+        if resolved.stale_links:
+            print(f"      [DRY RUN] Would remove {len(resolved.stale_links)} stale same-function TC link(s)"
+                  + (f", preserve {len(resolved.foreign_links)} foreign" if resolved.foreign_links else "")
+                  + ")")
 
+    # Only POST links for TCs not already linked (prevents 400/409 on duplicates)
     for tc_name in tp_file.tc_names:
+        if tc_name in resolved.already_linked_desired_names:
+            continue
+
         tc_wi_id = find_tc_work_item(updater, tc_name, tc_cache, verbose)
         if not tc_wi_id:
-            print(f"      ⚠ TC '{tc_name}' not found in Polarion, skipping")
+            print(f"      \u26a0 TC '{tc_name}' not found in Polarion, skipping")
             continue
 
         tc_short = updater._extract_short_id(tc_wi_id)
 
         if dry_run:
-            print(f"      [DRY RUN] Would link TP {tp_short} → implements → TC {tc_short} ({tc_name})")
+            print(f"      [DRY RUN] Would link TP {tp_short} \u2192 implements \u2192 TC {tc_short} ({tc_name})")
             linked_count += 1
             continue
 
         # Create new link: TP implements TC
         if _create_linked_work_item(updater, tp_wi_id, tc_wi_id, verbose):
-            print(f"      ✓ Linked TP {tp_short} → implements → TC {tc_short} ({tc_name})")
+            print(f"      \u2713 Linked TP {tp_short} \u2192 implements \u2192 TC {tc_short} ({tc_name})")
             linked_count += 1
         else:
-            print(f"      ✗ Failed to link TP {tp_short} → TC {tc_short} ({tc_name})")
+            print(f"      \u2717 Failed to link TP {tp_short} \u2192 TC {tc_short} ({tc_name})")
 
     return linked_count, False
 
@@ -1786,6 +2038,56 @@ Examples:
         print(f"Phase 0: Resolving CCR branch...")
         branch_name = resolve_ccr_branch(ccr_id, verbose=args.verbose)
 
+    # CCR internal-reference handling is disabled automatically if this branch
+    # is already merged to wassp-jenkins (additional commits on wassp-jenkins
+    # would no longer correspond to this CCR).
+    effective_ccr_id: Optional[str] = ccr_id
+    ccr_links_disabled_reason: Optional[str] = None
+
+    gitlab_client: Optional[GitLabRepoClient] = None
+    if use_remote or (ccr_id and gitlab_token):
+        gitlab_client = GitLabRepoClient(
+            args.gitlab_base, gitlab_token,
+            verify_ssl=args.verify_ssl,
+        )
+
+    merged_mr_iid: Optional[str] = None
+    if ccr_id:
+        if gitlab_client is None:
+            print("Phase 0: Could not verify MR merge state (GITLAB_TOKEN missing); CCR internal references remain enabled.")
+        else:
+            mr = gitlab_client.find_merged_mr_for_branch(
+                branch_name, target_branch="wassp-jenkins", verbose=args.verbose,
+            )
+            if mr:
+                mr_iid = mr.get("iid", "?")
+                merged_mr_iid = str(mr_iid)
+                effective_ccr_id = None
+                ccr_links_disabled_reason = (
+                    f"Branch '{branch_name}' is already merged to 'wassp-jenkins' "
+                    f"(MR !{mr_iid}); CCR internal references will be ignored."
+                )
+                _banner_lines = [
+                    f"BRANCH ALREADY MERGED TO wassp-jenkins  (CCR #{ccr_id}, MR !{mr_iid})",
+                    "CCR internal references will NOT be added, checked, or updated.",
+                    "Any additional commits on wassp-jenkins no longer correspond to this CCR.",
+                ]
+                _banner_width = max(max(len(l) for l in _banner_lines) + 8, 80)
+                print()
+                print("\n\n\n\n")
+                print("!" * _banner_width)
+                print("!!" + " WARNING ".center(_banner_width - 4, "!") + "!!")
+                for _ln in _banner_lines:
+                    print("!!  " + _ln.ljust(_banner_width - 8) + "  !!")
+                print("!" * _banner_width)
+                print()
+                print("\n\n\n\n")
+            elif args.verbose:
+                print(
+                    f"  [VERBOSE] Branch '{branch_name}' is not merged to 'wassp-jenkins' "
+                    "(or no merged MR found); CCR internal references enabled."
+                )
+
     if use_remote:
         # Remote mode: files are fetched from the CCR/feature branch,
         # but hyperlinks use --gitlab-base as-is (e.g. wassp-jenkins).
@@ -1793,11 +2095,9 @@ Examples:
         if args.verbose:
             print(f"  [VERBOSE] Using remote mode (GitLab API) on branch '{branch_name}'")
             print(f"  [VERBOSE] Source reference base: {gitlab_base}")
-
-        gitlab_client = GitLabRepoClient(
-            args.gitlab_base, gitlab_token,
-            verify_ssl=args.verify_ssl,
-        )
+        if gitlab_client is None:
+            print("Error: internal error - GitLab client was not initialized for remote mode")
+            sys.exit(1)
     else:
         # Local mode: checkout the branch
         gitlab_base = args.gitlab_base
@@ -1860,12 +2160,20 @@ Examples:
         tl_url, tp_url = build_gitlab_urls(tp_file, gitlab_base)
         lines = [f"  {short_id} - {wi_title}"]
         if tp_file.group_key in multi_file_groups:
-            lines.append(f"          \u21b3 {tp_file.variant}")
+            _variant_note = f" ({tp_file.original_test_name})" if tp_file.original_test_name else ""
+            lines.append(f"          \u21b3 {tp_file.variant}{_variant_note}")
         lines.append("")
         # Fetch linked TC titles and current hyperlinks to show alignment
-        prefix = f"{tp_file.test_name}_"
+        effective_prefix, ambiguous = _compute_effective_tc_prefix(
+            tp_file.test_name, tp_file.tc_names
+        )
+        desired_tc_set = set(tp_file.tc_names)
         all_tc_titles = _fetch_linked_tc_titles(updater, wi_id)
-        foreign_tc_names = sorted(t for t in all_tc_titles if not t.startswith(prefix))
+        # Foreign = not same-function AND not in the desired TC list
+        foreign_tc_names = sorted(
+            t for t in all_tc_titles
+            if not t.startswith(effective_prefix) and t not in desired_tc_set
+        )
         # Fetch current hyperlink URIs for alignment check
         fetch_url = f"{updater.base_url}/projects/{updater.project_id}/workitems/{short_id}"
         fetch_resp = updater.session.get(
@@ -1879,16 +2187,20 @@ Examples:
         # Same-function TCs that are linked but NOT in the tp file (stale links)
         same_function_titles = sorted(
             t for t in all_tc_titles
-            if t.startswith(prefix) and t not in set(tp_file.tc_names)
+            if t.startswith(effective_prefix) and t not in desired_tc_set
         )
+        if ambiguous:
+            lines.append(f"      \u26a0 AMBIGUOUS TC NAMING \u2014 TC linking will be SKIPPED for this TP.")
+            lines.append(f"        (TP file mixes full-form and base-form TC names; fix and re-run.)")
         if tp_file.tc_names:
             for tc_name in tp_file.tc_names:
                 if tc_name in all_tc_titles:
                     lines.append(f"      \u2713 [implements] {tc_name}")
                 else:
                     lines.append(f"      \u2717 [implements] {tc_name}")
-        for tc_name in same_function_titles:
-            lines.append(f"      [-] [implements] {tc_name}  Not in the TP file, would be removed")
+        if not ambiguous:
+            for tc_name in same_function_titles:
+                lines.append(f"      [-] [implements] {tc_name}  Not in the TP file, would be removed")
         if foreign_tc_names:
             for tc_name in foreign_tc_names:
                 lines.append(f"      \u2713 [implements] {tc_name}  (foreign)")
@@ -1899,9 +2211,11 @@ Examples:
             lines.append(f"      {mark} [source reference] {tl_url}")
         tp_mark = "\u2713" if tp_url in current_uris else "\u2717"
         lines.append(f"      {tp_mark} [source reference] {tp_url}")
-        if ccr_id:
-            ccr_mark = "\u2713" if _has_ccr_link(current_uris, ccr_id) else "\u2717"
-            lines.append(f"      {ccr_mark} [internal reference] CCR #{ccr_id}")
+        if effective_ccr_id:
+            ccr_mark = "\u2713" if _has_ccr_link(current_uris, effective_ccr_id) else "\u2717"
+            lines.append(f"      {ccr_mark} [internal reference] CCR #{effective_ccr_id}")
+        elif ccr_id and merged_mr_iid:
+            lines.append(f"      [~] [internal reference] skipped \u2014 branch already merged (MR !{merged_mr_iid})")
         _m = re.search(r"_(\d+)$", wi_title)
         _num = int(_m.group(1)) if _m else 0
         info_by_group.setdefault(tp_file.test_name, []).append(
@@ -1913,7 +2227,8 @@ Examples:
         tl_url, tp_url = build_gitlab_urls(tp_file, gitlab_base)
         lines = [f"  (new) {title}"]
         if tp_file.group_key in multi_file_groups:
-            lines.append(f"          \u21b3 {tp_file.variant}")
+            _variant_note = f" ({tp_file.original_test_name})" if tp_file.original_test_name else ""
+            lines.append(f"          \u21b3 {tp_file.variant}{_variant_note}")
         lines.append("")
         if tp_file.tc_names:
             for tc_name in tp_file.tc_names:
@@ -1922,6 +2237,10 @@ Examples:
         if tl_url:
             lines.append(f"      [source reference] {tl_url}")
         lines.append(f"      [source reference] {tp_url}")
+        if effective_ccr_id:
+            lines.append(f"      [internal reference] CCR #{effective_ccr_id}")
+        elif ccr_id and merged_mr_iid:
+            lines.append(f"      [~] [internal reference] skipped \u2014 branch already merged (MR !{merged_mr_iid})")
         info_by_group.setdefault(tp_file.test_name, []).append(
             ((tp_file.test_type, number), "\n".join(lines))
         )
@@ -1944,6 +2263,8 @@ Examples:
     branch_label = f"CCR #{ccr_id} ({branch_name})" if ccr_id else branch_name
     print(f"\n{'=' * 180}")
     print(f"Resolved Mappings from {branch_label} and Polarion Work Items")
+    if ccr_links_disabled_reason:
+        print(f"Note: {ccr_links_disabled_reason}")
     print("=" * 180)
     first_group = True
     for group_key in sorted(info_by_group.keys()):
@@ -1992,7 +2313,7 @@ Examples:
                 # Step 1: Check and apply WI attribute changes
                 result = update_existing_work_item(
                     updater, wi_id, wi_title, tp_file,
-                    gitlab_base, ccr_id,
+                    gitlab_base, effective_ccr_id,
                     component=args.component, category=args.category,
                     dry_run=dry_run, verbose=args.verbose,
                 )
@@ -2006,15 +2327,21 @@ Examples:
                     continue
 
                 # Step 2: Pre-resolve TC alignment (avoid double fetch)
-                if tp_file.tc_names and wi_id != "DRY_RUN":
+                effective_prefix, ambiguous = _compute_effective_tc_prefix(
+                    tp_file.test_name, tp_file.tc_names
+                )
+                desired_tc_set = set(tp_file.tc_names)
+                if tp_file.tc_names and wi_id != "DRY_RUN" and not ambiguous:
                     resolved = _resolve_existing_tc_links(
-                        updater, wi_id, tp_file.test_name, args.verbose
+                        updater, wi_id, effective_prefix, desired_tc_set, args.verbose
                     )
-                    same_names = resolved[0]
-                    tc_will_change = same_names != set(tp_file.tc_names)
+                    # TC links will change if anything needs adding or anything is stale.
+                    to_add = desired_tc_set - resolved.already_linked_desired_names
+                    tc_will_change = bool(to_add) or bool(resolved.stale_links)
                 else:
                     resolved = None
-                    tc_will_change = bool(tp_file.tc_names)
+                    # Ambiguous → we won't touch TC links, so nothing will change from our side.
+                    tc_will_change = bool(tp_file.tc_names) and not ambiguous
 
                 # Step 3: If only TC links need changes (WI attrs aligned),
                 # ensure rework status before modifying links
@@ -2036,6 +2363,8 @@ Examples:
                 tc_count, tc_aligned = link_test_cases_to_tp(
                     updater, wi_id, tp_file, tc_cache,
                     dry_run=dry_run, verbose=args.verbose,
+                    effective_prefix=effective_prefix,
+                    ambiguous=ambiguous,
                     _resolved=resolved,
                 )
                 tc_linked_total += tc_count
@@ -2045,17 +2374,23 @@ Examples:
 
                 if fully_aligned:
                     aligned_count += 1
-                    foreign_count = len(resolved[3]) if resolved and resolved[3] else 0
+                    foreign_count = len(resolved.foreign_links) if resolved and resolved.foreign_links else 0
                     tc_summary = f"{len(tp_file.tc_names)} TCs"
                     if foreign_count:
                         tc_summary += f", {foreign_count} foreign"
                     lines = [f"  [ALREADY ALIGNED] {short_id} - {wi_title}"]
                     if tp_file.group_key in multi_file_groups:
-                        lines.append(f"          \u21b3 {tp_file.variant}")
-                    lines.append(f"      TCs already aligned ({tc_summary}) \u2713")
+                        _variant_note = f" ({tp_file.original_test_name})" if tp_file.original_test_name else ""
+                        lines.append(f"          \u21b3 {tp_file.variant}{_variant_note}")
+                    if ambiguous:
+                        lines.append(f"      \u26a0 TC linking SKIPPED \u2014 ambiguous TC naming in TP file")
+                    else:
+                        lines.append(f"      TCs already aligned ({tc_summary}) \u2713")
                     lines.append(f"      Source references already aligned \u2713")
-                    if ccr_id:
+                    if effective_ccr_id:
                         lines.append(f"      Internal reference already aligned \u2713")
+                    elif ccr_id and merged_mr_iid:
+                        lines.append(f"      Internal reference skipped \u2014 branch already merged (MR !{merged_mr_iid})")
                     lines.append(f"      Component already aligned \u2713")
                     lines.append(f"      Category already aligned \u2713")
                     _m = re.search(r"_(\d+)$", wi_title)
@@ -2069,16 +2404,20 @@ Examples:
                     tag = "[WOULD UPDATE]" if dry_run else "[UPDATED]"
                     lines = [f"  {tag} {short_id} - {wi_title}"]
                     if tp_file.group_key in multi_file_groups:
-                        lines.append(f"          \u21b3 {tp_file.variant}")
+                        _variant_note = f" ({tp_file.original_test_name})" if tp_file.original_test_name else ""
+                        lines.append(f"          \u21b3 {tp_file.variant}{_variant_note}")
                     if tc_aligned and tp_file.tc_names:
-                        foreign_count = len(resolved[3]) if resolved and resolved[3] else 0
+                        foreign_count = len(resolved.foreign_links) if resolved and resolved.foreign_links else 0
                         tc_summary = f"{len(tp_file.tc_names)} TCs"
                         if foreign_count:
                             tc_summary += f", {foreign_count} foreign"
-                        lines.append(f"      TCs already aligned ({tc_summary}) \u2713")
+                        if ambiguous:
+                            lines.append(f"      \u26a0 TC linking SKIPPED \u2014 ambiguous TC naming (mixed full-form and base-form). Fix TP file and re-run.")
+                        else:
+                            lines.append(f"      TCs already aligned ({tc_summary}) \u2713")
                     else:
-                        same_names = resolved[0] if resolved else set()
-                        desired_set = set(tp_file.tc_names)
+                        same_names = resolved.already_linked_desired_names if resolved else set()
+                        stale_names_list = sorted(resolved.stale_names) if resolved else []
                         add_suffix = "Currently missing - will be added" if dry_run else "Was missing, added"
                         remove_suffix = "Not in the TP file, would be removed" if dry_run else "Not in the TP file, removed"
                         for tc_name in tp_file.tc_names:
@@ -2089,11 +2428,10 @@ Examples:
                             else:
                                 lines.append(f"      [+] [implements] {tc_name}  {add_suffix}")
                         # Same-function TCs linked on WI but not in TP file (stale — removed/would be removed)
-                        stale_names = sorted(same_names - desired_set)
-                        for tc_name in stale_names:
+                        for tc_name in stale_names_list:
                             lines.append(f"      [-] [implements] {tc_name}  {remove_suffix}")
-                        if resolved and resolved[3]:
-                            for tc_name in sorted(resolved[3]):
+                        if resolved and resolved.foreign_names:
+                            for tc_name in sorted(resolved.foreign_names):
                                 lines.append(f"      \u2713 [implements] {tc_name}  (foreign)")
                     lines.append("")
                     src_aligned = (tp_url in wi_current_uris and
@@ -2106,12 +2444,14 @@ Examples:
                             lines.append(f"      {mark} [source reference] {tl_url}")
                         tp_mark = "\u2713" if tp_url in wi_current_uris else "[+]"
                         lines.append(f"      {tp_mark} [source reference] {tp_url}")
-                    if ccr_id:
-                        ccr_url = build_ccr_url(ccr_id)
-                        if _has_ccr_link(wi_current_uris, ccr_id):
+                    if effective_ccr_id:
+                        ccr_url = build_ccr_url(effective_ccr_id)
+                        if _has_ccr_link(wi_current_uris, effective_ccr_id):
                             lines.append(f"      Internal reference already aligned \u2713")
                         else:
                             lines.append(f"      [+] [internal reference] {ccr_url}")
+                    elif ccr_id and merged_mr_iid:
+                        lines.append(f"      Internal reference skipped \u2014 branch already merged (MR !{merged_mr_iid})")
                     # Component alignment line
                     desired_component_str = f"comp_{args.component}"
                     if wi_current_component == desired_component_str:
@@ -2153,7 +2493,7 @@ Examples:
                 break
             created_id = create_new_work_item(
                 updater, number, tp_file,
-                gitlab_base, ccr_id,
+                gitlab_base, effective_ccr_id,
                 component=args.component, category=args.category,
                 author=args.author,
                 dry_run=dry_run, verbose=args.verbose,
@@ -2182,16 +2522,19 @@ Examples:
                 tag = "[WOULD CREATE]" if dry_run else "[CREATED]"
                 lines = [f"  {tag} {title}"]
                 if tp_file.group_key in multi_file_groups:
-                    lines.append(f"          \u21b3 {tp_file.variant}")
+                    _variant_note = f" ({tp_file.original_test_name})" if tp_file.original_test_name else ""
+                    lines.append(f"          \u21b3 {tp_file.variant}{_variant_note}")
                 for tc_name in tp_file.tc_names:
                     lines.append(f"      [+] [implements] {tc_name}")
                 lines.append("")
                 if tl_url:
                     lines.append(f"      [+] [source reference] {tl_url}")
                 lines.append(f"      [+] [source reference] {tp_url}")
-                if ccr_id:
-                    ccr_url = build_ccr_url(ccr_id)
+                if effective_ccr_id:
+                    ccr_url = build_ccr_url(effective_ccr_id)
                     lines.append(f"      [+] [internal reference] {ccr_url}")
+                elif ccr_id and merged_mr_iid:
+                    lines.append(f"      [~] [internal reference] skipped \u2014 branch already merged (MR !{merged_mr_iid})")
                 change_entries_by_group.setdefault(tp_file.test_name, []).append(
                     ((tp_file.test_type, number), "\n".join(lines))
                 )
