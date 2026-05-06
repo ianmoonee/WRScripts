@@ -1,5 +1,6 @@
 {
     "Artifact ID(s)": "",
     "Starting Version(s)": "",
-    "Ending Version(s)": ""
+    "Ending Version(s)": "",
+    "Related document ID(s) and Version(s)": "Wind River Shallowford - SBL - SBL_PRJ_CFG0 - Component Test Artifact Document - 0.10\nWind River Shallowford Secure Boot Loader - Software Verification Cases and Procedures - v0.04\nWind River Plan for Software Aspects of Certification for Shallowford Secure Boot Loader - v1.00\nWind River Generic - Software Configuration Management Plan - v3.00\nWind River Generic - Software Verification Plan - v4.00"
 }
