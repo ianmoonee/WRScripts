@@ -693,35 +693,25 @@ for idx, entry in enumerate(ccr_data):
             print("[DEBUG] Skipping update for review #{} (--update-most-recent)".format(REVIEW_ID))
         continue
 
-    # --- Write output files when --file-base is set ---
-    if FILE_BASE:
+    # --- 4000-char field guard ---
+    oversized = [(mf["name"], len(mf["value"][0])) for mf in merged_fields if len(mf["value"][0]) > 4000]
+    if oversized:
         results_dir = os.path.join(".", "{}_results".format(REVIEW_ID))
         os.makedirs(results_dir, exist_ok=True)
         for mf in merged_fields:
-            slug = field_name_to_slug(mf["name"])
-            out_path = os.path.join(results_dir, "{}-CCR{}-{}.txt".format(FILE_BASE, REVIEW_ID, slug))
+            if FILE_BASE:
+                slug = field_name_to_slug(mf["name"])
+                out_path = os.path.join(results_dir, "{}-CCR{}-{}.txt".format(FILE_BASE, REVIEW_ID, slug))
+            else:
+                safe_name = re.sub(r'[^\w]+', '_', mf["name"]).strip('_')
+                out_path = os.path.join(results_dir, "{}_{}.txt".format(REVIEW_ID, safe_name))
             with open(out_path, "w") as fout:
                 fout.write(mf["value"][0])
             if DEBUG:
                 print("[DEBUG] Wrote {}".format(out_path))
-        print("Field values for review #{} written to {}".format(REVIEW_ID, results_dir))
-
-    # --- 4000-char field guard ---
-    oversized = [(mf["name"], len(mf["value"][0])) for mf in merged_fields if len(mf["value"][0]) > 4000]
-    if oversized:
-        if not FILE_BASE:
-            results_dir = os.path.join(".", "{}_results".format(REVIEW_ID))
-            os.makedirs(results_dir, exist_ok=True)
-            for mf in merged_fields:
-                safe_name = re.sub(r'[^\w]+', '_', mf["name"]).strip('_')
-                out_path = os.path.join(results_dir, "{}_{}.txt".format(REVIEW_ID, safe_name))
-                with open(out_path, "w") as fout:
-                    fout.write(mf["value"][0])
         for fname, flen in oversized:
             print("WARNING: Field '{}' exceeds 4000 characters ({} chars).".format(fname, flen))
-        print("Skipping update for review #{}.{}".format(
-            REVIEW_ID,
-            "" if FILE_BASE else " Field values written to {}".format(results_dir)))
+        print("Skipping update for review #{}. Field values written to {}".format(REVIEW_ID, results_dir))
         print()
         continue
 
