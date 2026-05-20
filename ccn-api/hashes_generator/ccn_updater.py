@@ -9,6 +9,7 @@ will be modified.
 
 Modification History
 --------------------
+15may26,tal  Added fallback for inaccessible CCRs: report scraping + GitLab MR resolution.
 23apr26,tal  Added --component option for standardized overflow file naming.
 15apr26,tal Fixed fetching of files from CCR
 15apr26,pse  Added fall back logic for previous hash lookup: if no older CCR has a commit for a file, use the oldest commit on the current CCR's branch.
@@ -238,6 +239,152 @@ def _overflow_filename(mode, component, review_id, field_name):
     )
 
 
+# =========================================================================
+# Fallback helpers — used when the normal JSON API cannot fully access a CCR
+# (e.g. completed/archived reviews where getReviewSummary fails).
+# The chain is:
+#   1. Extract the Merge Request number from the review title
+#      (findReviewById still works; title contains e.g. "Gitlab merge request #1815")
+#   2. Query GitLab API to resolve the MR's source branch
+#   3. Use git to list files changed on that branch
+# =========================================================================
+
+GITLAB_BASE_URL = "https://ccn-gitlab.wrs.com"
+GITLAB_PROJECT = "shallowford/project/wassp"
+
+
+def extract_mr_from_title(title, debug=False):
+    """Extract the Merge Request number from a review title.
+
+    Looks for patterns like "merge request #1815" or "MR #1815" or "MR !1815".
+    Returns the MR number as a string, or None if not found.
+    """
+    if not title:
+        return None
+    for pattern in [
+        r'[Mm]erge\s+[Rr]equest\s*[#!](\d+)',
+        r'MR\s*[#!](\d+)',
+        r'#(\d+)',
+    ]:
+        match = re.search(pattern, title)
+        if match:
+            if debug:
+                print("[DEBUG] MR number extracted from title: !{}".format(match.group(1)))
+            return match.group(1)
+    if debug:
+        print("[DEBUG] No MR number found in title: '{}'".format(title))
+    return None
+
+
+def resolve_branch_from_mr(mr_number, debug=False):
+    """Query GitLab API to find the source branch of a Merge Request.
+
+    Searches in the 'shallowford/project/wassp' project.  Requires GITLAB_TOKEN env var.
+    Returns the source_branch string, or None on failure.
+    """
+    gitlab_token = os.environ.get("GITLAB_TOKEN")
+    if not gitlab_token:
+        print(
+            "WARNING: GITLAB_TOKEN environment variable is not set. "
+            "Cannot resolve branch from MR. Set it with:\n"
+            "  export GITLAB_TOKEN=\"your_token\"  (Linux)\n"
+            "  $env:GITLAB_TOKEN = \"your_token\"  (PowerShell)"
+        )
+        return None
+
+    encoded_project = GITLAB_PROJECT.replace("/", "%2F")
+    api_url = "{}/api/v4/projects/{}/merge_requests".format(GITLAB_BASE_URL, encoded_project)
+    headers = {"PRIVATE-TOKEN": gitlab_token}
+    params = {"iids[]": mr_number, "per_page": 10}
+    try:
+        resp = requests.get(api_url, headers=headers, params=params, verify=False, timeout=30)
+        if debug:
+            print("[DEBUG] GitLab MR lookup status: {}".format(resp.status_code))
+        if resp.status_code != 200:
+            if debug:
+                print("[DEBUG] GitLab response: {}".format(resp.text[:500]))
+            return None
+        items = resp.json()
+        if not items:
+            if debug:
+                print("[DEBUG] No MRs found with iid !{}".format(mr_number))
+            return None
+        source_branch = items[0].get("source_branch")
+        if debug:
+            print("[DEBUG] Resolved MR !{} -> branch '{}'".format(mr_number, source_branch))
+        return source_branch
+    except (requests.RequestException, ValueError) as e:
+        if debug:
+            print("[DEBUG] GitLab MR lookup failed: {}".format(e))
+        return None
+
+
+def get_files_from_branch(branch_name, wassp_path, debug=False):
+    """Get the list of files changed on a branch using git.
+
+    Uses 'git log' on the branch to list all files with non-merge commits.
+    Returns a list of file paths, or an empty list on failure.
+    """
+    ref = "origin/" + branch_name
+    cmd = ["git", "log", ref, "--no-merges", "--name-only", "--pretty=format:"]
+    if debug:
+        print("[DEBUG] get_files_from_branch cmd: {}".format(" ".join(cmd)))
+    try:
+        out = subprocess.check_output(
+            cmd, text=True, stderr=subprocess.PIPE, cwd=wassp_path
+        ).strip()
+        if not out:
+            return []
+        # Deduplicate while preserving order
+        seen = set()
+        files = []
+        for line in out.splitlines():
+            line = line.strip()
+            if line and line not in seen:
+                seen.add(line)
+                files.append(line)
+        if debug:
+            print("[DEBUG] get_files_from_branch found {} files".format(len(files)))
+        return files
+    except subprocess.CalledProcessError as e:
+        if debug:
+            print("[DEBUG] get_files_from_branch failed: {}".format(e))
+        return []
+
+
+def attempt_fallback(review_id, review_title, wassp_path, debug=False):
+    """Attempt the full fallback chain for an inaccessible CCR.
+
+    Uses the review title (from findReviewById) to extract the MR number,
+    then resolves the branch via GitLab and gets files from git.
+    Returns (branch_name, file_list) on success, or (None, []) on failure.
+    """
+    print("INFO: Attempting fallback for CCR #{}...".format(review_id))
+
+    # Step 1: Extract MR number from review title
+    mr_number = extract_mr_from_title(review_title, debug=debug)
+    if not mr_number:
+        print("WARNING: Could not extract MR number from title for CCR #{}: '{}'".format(review_id, review_title))
+        return None, []
+    print("INFO: Found MR !{} for CCR #{}".format(mr_number, review_id))
+
+    # Step 2: Resolve branch from MR via GitLab
+    branch_name = resolve_branch_from_mr(mr_number, debug=debug)
+    if not branch_name:
+        print("WARNING: Could not resolve branch from MR !{} for CCR #{}.".format(mr_number, review_id))
+        return None, []
+    print("INFO: Resolved branch '{}' for CCR #{}".format(branch_name, review_id))
+
+    # Step 3: Get files from branch via git
+    files = get_files_from_branch(branch_name, wassp_path, debug=debug)
+    if not files:
+        print("WARNING: No files found on branch '{}' for CCR #{}.".format(branch_name, review_id))
+        return branch_name, []
+    print("INFO: Found {} files on branch '{}' for CCR #{}".format(len(files), branch_name, review_id))
+
+    return branch_name, files
+
+
 def build_help_epilog():
     """Return the epilog text for --help output."""
     return """\
@@ -433,16 +580,22 @@ for REVIEW_ID in REVIEW_IDS:
 
     # Verify the review was found
     if "errors" in validate_data[1]:
-        # print("Review #{} not found: {}".format(REVIEW_ID, validate_data[1]["errors"]))
-        ccr_data.append({"review_id": REVIEW_ID, "branch": None, "files": []})
+        if DEBUG:
+            print("[DEBUG] Review #{} not found via API: {}".format(REVIEW_ID, validate_data[1]["errors"]))
+        print("WARNING: Could not access CCR #{} via API (findReviewById failed). Skipping.".format(REVIEW_ID))
+        ccr_data.append({"review_id": REVIEW_ID, "branch": None, "files": [], "fallback": True})
         continue
 
     review = validate_data[1].get("result", {})
 
     if not review:
-        # print("Review #{} not found".format(REVIEW_ID))
-        ccr_data.append({"review_id": REVIEW_ID, "branch": None, "files": []})
+        if DEBUG:
+            print("[DEBUG] Review #{} returned empty result".format(REVIEW_ID))
+        print("WARNING: Could not access CCR #{} via API (empty result). Skipping.".format(REVIEW_ID))
+        ccr_data.append({"review_id": REVIEW_ID, "branch": None, "files": [], "fallback": True})
         continue
+
+    review_title = review.get("title", "")
 
     # print("Review #{} found: {}".format(REVIEW_ID, review.get("title", "N/A")))
 
@@ -473,9 +626,12 @@ for REVIEW_ID in REVIEW_IDS:
     summary_data = resp_sum.json()
 
     review_files = []
+    summary_failed = False
     if "errors" in summary_data[1]:
-        # print("WARNING: Failed to fetch review files:", summary_data[1].get("errors"))
-        pass
+        if DEBUG:
+            print("[DEBUG] getReviewSummary failed for #{}: {}".format(
+                REVIEW_ID, summary_data[1].get("errors")))
+        summary_failed = True
     else:
         summary = summary_data[1].get("result", {})
         if DEBUG:
@@ -517,15 +673,30 @@ for REVIEW_ID in REVIEW_IDS:
 
     # Extract branch name from mergeMessage (text between the first pair of single quotes)
     # Path: result -> pullRequestMerges -> [0] -> mergeMessage
-    pull_request_merges = summary.get("pullRequestMerges", [])
-    merge_message = pull_request_merges[0].get("mergeMessage", "") if pull_request_merges else ""
     branch_name = None
-    if merge_message:
-        parts = merge_message.split("'")
-        if len(parts) >= 2:
-            branch_name = parts[1]
+    if not summary_failed:
+        pull_request_merges = summary.get("pullRequestMerges", [])
+        merge_message = pull_request_merges[0].get("mergeMessage", "") if pull_request_merges else ""
+        if merge_message:
+            parts = merge_message.split("'")
+            if len(parts) >= 2:
+                branch_name = parts[1]
 
-    ccr_data.append({"review_id": REVIEW_ID, "branch": branch_name, "files": review_files})
+    # If the normal API returned no branch or no files, attempt fallback
+    if branch_name is None or not review_files:
+        if DEBUG:
+            print("[DEBUG] Normal API incomplete for #{} (branch={}, files={}). Trying fallback...".format(
+                REVIEW_ID, branch_name, len(review_files)))
+        fb_branch, fb_files = attempt_fallback(REVIEW_ID, review_title, WASSP_PATH, debug=DEBUG)
+        if fb_branch:
+            branch_name = fb_branch
+        if fb_files:
+            review_files = fb_files
+        if branch_name is None and not review_files:
+            print("WARNING: Could not access CCR #{} via API or fallback. Skipping.".format(REVIEW_ID))
+        ccr_data.append({"review_id": REVIEW_ID, "branch": branch_name, "files": review_files, "fallback": True})
+    else:
+        ccr_data.append({"review_id": REVIEW_ID, "branch": branch_name, "files": review_files, "fallback": False})
 
 # =========================================================================
 # SECOND PASS — Look up git hashes and update reviews
@@ -540,6 +711,12 @@ for idx, entry in enumerate(ccr_data):
     REVIEW_ID = entry["review_id"]
     BRANCH_NAME = entry["branch"]
     REVIEW_FILES = entry["files"]
+
+    # Skip reviews with no data (fallback also failed)
+    if BRANCH_NAME is None and not REVIEW_FILES:
+        print("WARNING: Skipping CCR #{} — no data available (review may be inaccessible).".format(REVIEW_ID))
+        print()
+        continue
 
     # Collect hashes for all files first
     if DEBUG:
