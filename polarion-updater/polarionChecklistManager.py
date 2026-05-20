@@ -224,15 +224,14 @@ def discover_function_names_via_api(session: requests.Session, base_url: str,
                                     project_id: str, component: str,
                                     api_type: str, verify_ssl: bool,
                                     verbose: bool = False
-                                    ) -> Optional[List[str]]:
+                                    ) -> List[str]:
     """
     Fetch all API work items (one per function) for the given component and
     return their titles as a list of function names.
 
-    Returns None if the result is truncated (totalCount > returned items),
-    in which case the caller should print a helpful message asking the user
-    to narrow with --pattern. Returns an empty list if the type yields
-    nothing (likely wrong --api-type).
+    Uses links.next pagination if available, otherwise returns what was on
+    the first page. Returns an empty list if the type yields nothing
+    (likely wrong --api-type).
     """
     url = f"{base_url}/projects/{project_id}/workitems"
     query = (
@@ -254,21 +253,48 @@ def discover_function_names_via_api(session: requests.Session, base_url: str,
     body = resp.json()
     items = body.get("data", [])
     total = body.get("meta", {}).get("totalCount")
+    links = body.get("links", {})
+    if verbose:
+        print(f"  [DEBUG] API items returned: {len(items)}, totalCount={total}")
+        print(f"  [DEBUG] links keys: {list(links.keys())}")
+        if links.get("next"):
+            print(f"  [DEBUG] links.next: {links['next']}")
+        if links.get("self"):
+            print(f"  [DEBUG] links.self: {links['self']}")
+
+    # Collect items from this page
     names: List[str] = []
     for item in items:
         title = item.get("attributes", {}).get("title", "").strip()
         if title:
             names.append(title)
+
+    # Follow links.next if available (JSON:API cursor pagination)
+    next_url = links.get("next")
+    page = 1
+    while next_url:
+        page += 1
+        if verbose:
+            print(f"  [DEBUG] Following links.next (page {page})...")
+        resp = session.get(next_url, verify=verify_ssl)
+        if resp.status_code != 200:
+            if verbose:
+                print(f"  [DEBUG] links.next returned {resp.status_code}, stopping.")
+            break
+        body = resp.json()
+        page_items = body.get("data", [])
+        if not page_items:
+            break
+        for item in page_items:
+            title = item.get("attributes", {}).get("title", "").strip()
+            if title:
+                names.append(title)
+        if verbose:
+            print(f"  [DEBUG] Page {page}: {len(page_items)} items, running total: {len(names)}")
+        next_url = body.get("links", {}).get("next")
+
     if verbose:
-        print(f"  [DEBUG] API items returned: {len(items)}, totalCount={total}")
-    if total is not None and total > len(items):
-        # Truncated — caller should abort with a useful message
-        print(f"\n  WARNING: Component '{component}' has {total} API work items, but")
-        print(f"  only {len(items)} were returned in a single page. The script")
-        print(f"  cannot reliably enumerate every function without a recursive")
-        print(f"  search. Re-run with --pattern <prefix> to narrow the scope,")
-        print(f"  e.g. --pattern nvme_ (multiple prefixes are allowed).")
-        return None
+        print(f"  [DEBUG] Total API function names collected: {len(names)}")
     return names
 
 
@@ -278,16 +304,44 @@ def fetch_tcs_for_function(session: requests.Session, base_url: str,
                            verbose: bool = False) -> List[str]:
     """
     Fetch all TC work item IDs for a single function via title:<func>_*.
-    Returns a list of full WI IDs. Prints a warning if a single function's
-    TC count exceeds one page (very rare).
+    If the result is truncated (>100 items), splits into HLTC/LLTC sub-queries
+    and further splits by digit prefix as needed.
+    Returns a list of full WI IDs.
     """
     url = f"{base_url}/projects/{project_id}/workitems"
-    query = (
+    base_query = (
         f"type:{TC_TYPE} AND "
         f"fld_component.KEY:comp_{component} AND "
-        f"NOT status:deleted AND NOT HAS_VALUE:resolution AND "
-        f"title:{func_name}_*"
+        f"NOT status:deleted AND NOT HAS_VALUE:resolution"
     )
+    ids_set: set = set()
+
+    def _query_with_title_prefix(title_prefix: str) -> None:
+        """Query for TCs matching title_prefix*, recurse by digit if truncated."""
+        query = f"{base_query} AND title:{title_prefix}*"
+        params = {"query": query, "fields[workitems]": "id"}
+        resp = session.get(url, params=params, verify=verify_ssl)
+        if resp.status_code != 200:
+            if verbose:
+                print(f"  [DEBUG] GET {url} -> {resp.status_code}")
+            return
+        body = resp.json()
+        items = body.get("data", [])
+        total = body.get("meta", {}).get("totalCount")
+        ids = [item["id"] for item in items if isinstance(item, dict) and "id" in item]
+        truncated = (total is not None and total > len(ids)) or len(ids) >= 100
+        if truncated:
+            if verbose:
+                print(f"  [DEBUG] title:{title_prefix}* -> {len(ids)} returned, total={total}, splitting by digit...")
+            for d in "0123456789":
+                _query_with_title_prefix(f"{title_prefix}{d}")
+        else:
+            ids_set.update(ids)
+            if ids and verbose:
+                print(f"  [DEBUG] title:{title_prefix}* -> {len(ids)} TCs")
+
+    # First try the broad query
+    query = f"{base_query} AND title:{func_name}_*"
     params = {"query": query, "fields[workitems]": "id"}
     resp = session.get(url, params=params, verify=verify_ssl)
     if resp.status_code != 200:
@@ -299,12 +353,22 @@ def fetch_tcs_for_function(session: requests.Session, base_url: str,
     items = body.get("data", [])
     total = body.get("meta", {}).get("totalCount")
     ids = [item["id"] for item in items if isinstance(item, dict) and "id" in item]
+    truncated = (total is not None and total > len(ids)) or len(ids) >= 100
+
+    if not truncated:
+        if verbose:
+            print(f"  [DEBUG] title:{func_name}_* -> {len(ids)} TCs (totalCount={total})")
+        return ids
+
+    # Truncated: split into HLTC and LLTC sub-queries, then by digit
     if verbose:
-        print(f"  [DEBUG] title:{func_name}_* -> {len(ids)} TCs (totalCount={total})")
-    if total is not None and total > len(ids):
-        print(f"    WARNING: function '{func_name}' has {total} TCs, only {len(ids)}")
-        print(f"             were returned. Some TCs will be missed for this function.")
-    return ids
+        print(f"  [DEBUG] title:{func_name}_* -> {len(ids)} returned, total={total}, splitting by HLTC/LLTC...")
+    for tc_type in ("HLTC", "LLTC"):
+        _query_with_title_prefix(f"{func_name}_{tc_type}_")
+
+    if verbose:
+        print(f"  [DEBUG] title:{func_name}_* -> {len(ids_set)} TCs total (after split)")
+    return list(ids_set)
 
 
 # ---------------------------------------------------------------------------
@@ -955,9 +1019,6 @@ def run(args: argparse.Namespace) -> None:
             session, base_url, project_id, component, args.api_type,
             verify_ssl, verbose=verbose,
         )
-        if func_names is None:
-            # Truncated — message already printed by helper
-            sys.exit(2)
         if not func_names:
             print(f"  No API work items found for component '{component}' with")
             print(f"  type='{args.api_type}'. Run with --list-types to discover")
