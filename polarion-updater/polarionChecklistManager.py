@@ -54,6 +54,9 @@ import urllib3
 
 TC_TYPE = "wi_testCase"
 CHECKLIST_TYPE = "wi_testcase_checklist"
+# Default Polarion work item type for "Application Programming Interface" items
+# (one item per function in a component). Overridable with --api-type.
+DEFAULT_API_TYPE = "wi_API"
 # Regex to extract function name and TC type from a TC title
 # e.g. "nvmeXbdStrategy_HLTC_1" -> ("nvmeXbdStrategy", "HLTC")
 TC_TITLE_RE = re.compile(r'^(.+?)_(HLTC|LLTC)_\d+$')
@@ -118,20 +121,31 @@ def query_work_items_paginated(session: requests.Session, base_url: str,
             "query": sub_query,
             "fields[workitems]": "id",
         }
-        items = paginated_get(session, url, params, verify_ssl, verbose=verbose)
-        ids = [item["id"] for item in items if isinstance(item, dict) and "id" in item]
-        if len(ids) >= 100:
-            # Hit API cap — recurse with longer prefix
+        resp = session.get(url, params=params, verify=verify_ssl)
+        if verbose:
+            print(f"  [DEBUG] GET {resp.request.url}")
+            print(f"  [DEBUG] Status: {resp.status_code}")
+        if resp.status_code != 200:
             if verbose:
-                print(f"  [DEBUG] title:{prefix}* -> {len(ids)} (capped), splitting deeper...")
-            for c in "abcdefghijklmnopqrstuvwxyz":
+                print(f"  [DEBUG] Response preview: {resp.text[:500]}")
+            return
+        body = resp.json()
+        items = body.get("data", [])
+        total = body.get("meta", {}).get("totalCount")
+        ids = [item["id"] for item in items if isinstance(item, dict) and "id" in item]
+        # Check if there are more items than returned (API page limit)
+        need_split = (total is not None and total > len(ids)) or len(ids) >= 100
+        if need_split:
+            if verbose:
+                print(f"  [DEBUG] title:{prefix}* -> {len(ids)} returned, total={total}, splitting deeper...")
+            for c in "abcdefghijklmnopqrstuvwxyz0123456789":
                 query_by_prefix(f"{prefix}{c}")
         else:
             wi_ids_set.update(ids)
             if ids and verbose:
                 print(f"  [DEBUG] title:{prefix}* -> {len(ids)} items")
 
-    for c in "abcdefghijklmnopqrstuvwxyz":
+    for c in "abcdefghijklmnopqrstuvwxyz0123456789":
         query_by_prefix(c)
 
     if verbose:
@@ -158,6 +172,139 @@ def fetch_work_item(session: requests.Session, base_url: str, project_id: str,
     if resp.status_code != 200:
         return None
     return resp.json().get("data", {})
+
+
+# ---------------------------------------------------------------------------
+# API-driven function discovery
+# ---------------------------------------------------------------------------
+
+def list_component_types(session: requests.Session, base_url: str,
+                         project_id: str, component: str,
+                         verify_ssl: bool, verbose: bool = False) -> None:
+    """
+    Discovery helper: list distinct work item types found in the component,
+    with counts. Useful for identifying the correct --api-type value the
+    first time the script is used against a new Polarion setup.
+    """
+    print(f"\n{SEP}")
+    print(f"LIST TYPES MODE — distinct work item types for component: {component}")
+    print(SEP)
+
+    url = f"{base_url}/projects/{project_id}/workitems"
+    query = (
+        f"fld_component.KEY:comp_{component} AND "
+        f"NOT status:deleted AND NOT HAS_VALUE:resolution"
+    )
+    params = {"query": query, "fields[workitems]": "id,type"}
+    if verbose:
+        print(f"  [DEBUG] Query: {query}")
+    resp = session.get(url, params=params, verify=verify_ssl)
+    if resp.status_code != 200:
+        print(f"  Error: HTTP {resp.status_code}")
+        print(f"  {resp.text[:500]}")
+        return
+    body = resp.json()
+    items = body.get("data", [])
+    total = body.get("meta", {}).get("totalCount")
+    counts: Dict[str, int] = defaultdict(int)
+    for item in items:
+        wi_type = item.get("attributes", {}).get("type", "<unknown>")
+        counts[wi_type] += 1
+    print(f"\n  Sampled {len(items)} item(s) (totalCount={total}) — counts may be truncated:")
+    for wi_type in sorted(counts.keys()):
+        print(f"    {wi_type:40s} {counts[wi_type]:5d}")
+    if total is not None and total > len(items):
+        print(f"\n  NOTE: Only the first page was sampled. Real counts per type")
+        print(f"        will be higher. The list of distinct types above is")
+        print(f"        usually still complete enough to identify --api-type.")
+    print(f"\n{SEP}")
+
+
+def discover_function_names_via_api(session: requests.Session, base_url: str,
+                                    project_id: str, component: str,
+                                    api_type: str, verify_ssl: bool,
+                                    verbose: bool = False
+                                    ) -> Optional[List[str]]:
+    """
+    Fetch all API work items (one per function) for the given component and
+    return their titles as a list of function names.
+
+    Returns None if the result is truncated (totalCount > returned items),
+    in which case the caller should print a helpful message asking the user
+    to narrow with --pattern. Returns an empty list if the type yields
+    nothing (likely wrong --api-type).
+    """
+    url = f"{base_url}/projects/{project_id}/workitems"
+    query = (
+        f"type:{api_type} AND "
+        f"fld_component.KEY:comp_{component} AND "
+        f"NOT status:deleted"
+    )
+    params = {"query": query, "fields[workitems]": "id,title"}
+    if verbose:
+        print(f"  [DEBUG] Query: {query}")
+    resp = session.get(url, params=params, verify=verify_ssl)
+    if verbose:
+        print(f"  [DEBUG] GET {resp.request.url} -> {resp.status_code}")
+    if resp.status_code != 200:
+        print(f"  Error fetching API items: HTTP {resp.status_code}")
+        if verbose:
+            print(f"  Response: {resp.text[:500]}")
+        return []
+    body = resp.json()
+    items = body.get("data", [])
+    total = body.get("meta", {}).get("totalCount")
+    names: List[str] = []
+    for item in items:
+        title = item.get("attributes", {}).get("title", "").strip()
+        if title:
+            names.append(title)
+    if verbose:
+        print(f"  [DEBUG] API items returned: {len(items)}, totalCount={total}")
+    if total is not None and total > len(items):
+        # Truncated — caller should abort with a useful message
+        print(f"\n  WARNING: Component '{component}' has {total} API work items, but")
+        print(f"  only {len(items)} were returned in a single page. The script")
+        print(f"  cannot reliably enumerate every function without a recursive")
+        print(f"  search. Re-run with --pattern <prefix> to narrow the scope,")
+        print(f"  e.g. --pattern nvme_ (multiple prefixes are allowed).")
+        return None
+    return names
+
+
+def fetch_tcs_for_function(session: requests.Session, base_url: str,
+                           project_id: str, component: str,
+                           func_name: str, verify_ssl: bool,
+                           verbose: bool = False) -> List[str]:
+    """
+    Fetch all TC work item IDs for a single function via title:<func>_*.
+    Returns a list of full WI IDs. Prints a warning if a single function's
+    TC count exceeds one page (very rare).
+    """
+    url = f"{base_url}/projects/{project_id}/workitems"
+    query = (
+        f"type:{TC_TYPE} AND "
+        f"fld_component.KEY:comp_{component} AND "
+        f"NOT status:deleted AND NOT HAS_VALUE:resolution AND "
+        f"title:{func_name}_*"
+    )
+    params = {"query": query, "fields[workitems]": "id"}
+    resp = session.get(url, params=params, verify=verify_ssl)
+    if resp.status_code != 200:
+        if verbose:
+            print(f"  [DEBUG] GET {url} -> {resp.status_code}")
+            print(f"  [DEBUG] Response: {resp.text[:500]}")
+        return []
+    body = resp.json()
+    items = body.get("data", [])
+    total = body.get("meta", {}).get("totalCount")
+    ids = [item["id"] for item in items if isinstance(item, dict) and "id" in item]
+    if verbose:
+        print(f"  [DEBUG] title:{func_name}_* -> {len(ids)} TCs (totalCount={total})")
+    if total is not None and total > len(ids):
+        print(f"    WARNING: function '{func_name}' has {total} TCs, only {len(ids)}")
+        print(f"             were returned. Some TCs will be missed for this function.")
+    return ids
 
 
 # ---------------------------------------------------------------------------
@@ -759,6 +906,11 @@ def run(args: argparse.Namespace) -> None:
                        verify_ssl, verbose, pattern=args.pattern)
         return
 
+    if args.list_types:
+        list_component_types(session, base_url, project_id, component,
+                             verify_ssl, verbose)
+        return
+
     # ---------------------------------------------------------------
     # Phase 1: Fetch all TCs for the component
     # ---------------------------------------------------------------
@@ -774,9 +926,16 @@ def run(args: argparse.Namespace) -> None:
     ]
     tc_query = " AND ".join(tc_query_parts)
 
-    # If pattern specified, run separate queries per pattern prefix
-    # (mimics polarionSameAsSearch.py pattern expansion)
+    # Strategy:
+    #   - If --pattern is given, fall back to the legacy prefix-recursion path
+    #     (the user has already narrowed the scope, so recursion is cheap).
+    #   - Otherwise, ask Polarion for the list of "Application Programming
+    #     Interface" work items for this component — one per function — and
+    #     fetch TCs per function via title:<func>_*. This avoids the
+    #     blow-up of recursive prefix search on components whose function
+    #     names share a long common prefix (e.g. nvme_*).
     if args.pattern:
+        print(f"  Using --pattern path (prefix recursion).")
         all_tc_ids: List[str] = []
         seen: set = set()
         for prefix in args.pattern:
@@ -791,9 +950,32 @@ def run(args: argparse.Namespace) -> None:
                     all_tc_ids.append(wid)
         tc_ids = all_tc_ids
     else:
-        tc_ids = query_work_items_paginated(session, base_url, project_id,
-                                            tc_query, verify_ssl,
-                                            verbose=verbose)
+        print(f"  Discovering functions via API work items (type={args.api_type})...")
+        func_names = discover_function_names_via_api(
+            session, base_url, project_id, component, args.api_type,
+            verify_ssl, verbose=verbose,
+        )
+        if func_names is None:
+            # Truncated — message already printed by helper
+            sys.exit(2)
+        if not func_names:
+            print(f"  No API work items found for component '{component}' with")
+            print(f"  type='{args.api_type}'. Run with --list-types to discover")
+            print(f"  the correct value, then pass it via --api-type.")
+            return
+        print(f"  Discovered {len(func_names)} function(s) via API items.")
+        all_tc_ids = []
+        seen = set()
+        for func_name in func_names:
+            ids = fetch_tcs_for_function(
+                session, base_url, project_id, component, func_name,
+                verify_ssl, verbose=verbose,
+            )
+            for wid in ids:
+                if wid not in seen:
+                    seen.add(wid)
+                    all_tc_ids.append(wid)
+        tc_ids = all_tc_ids
 
     tc_ids = sorted(set(tc_ids))
     print(f"  Found {len(tc_ids)} test case(s)")
@@ -1062,6 +1244,17 @@ Examples:
     parser.add_argument(
         "--dump-tc", action="store_true", default=False,
         help="Fetch one existing TC and print ALL its fields, then exit",
+    )
+    parser.add_argument(
+        "--list-types", action="store_true", default=False,
+        help="List distinct work item types found in the component (with counts) "
+             "and exit. Use to discover the correct value for --api-type.",
+    )
+    parser.add_argument(
+        "--api-type", default=DEFAULT_API_TYPE,
+        help=f"Polarion work item type for 'Application Programming Interface' "
+             f"items used to enumerate functions (default: {DEFAULT_API_TYPE}). "
+             f"Run --list-types if unsure.",
     )
     parser.add_argument(
         "--verify-ssl", action="store_true", default=False,
