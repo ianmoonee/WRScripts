@@ -398,10 +398,13 @@ def get_existing_linked_tp_ids(
     verbose: bool = False,
     debug: bool = False,
 ) -> set:
-    """Fetch the set of WI short IDs already linked from *tr_wi_id* via derived_from."""
+    """Fetch the set of composite link IDs for derived_from links on *tr_wi_id*."""
     tr_short = extract_short_id(tr_wi_id)
     url = f"{base_url}/projects/{project_id}/workitems/{tr_short}/linkedworkitems"
-    params = {"fields[linkedworkitems]": "id", "query": "role:derived_from"}
+    # Do NOT use a 'query' filter here — that parameter is only valid on the /workitems
+    # collection endpoint; on /linkedworkitems it is unsupported and may return an error
+    # or be silently ignored, causing the function to return an empty set.
+    params = {"fields[linkedworkitems]": "id,role"}
     if debug:
         print(f"    [DEBUG] GET {url} params={params}")
     resp = session.get(url, params=params, verify=verify_ssl)
@@ -412,9 +415,18 @@ def get_existing_linked_tp_ids(
     items = resp.json().get("data", [])
     linked_ids = set()
     for item in items:
-        if isinstance(item, dict) and "id" in item:
-            # id format is typically "project/TR_ID/project/TP_ID" or similar
-            linked_ids.add(item["id"])
+        if not (isinstance(item, dict) and "id" in item):
+            continue
+        item_id = item["id"]
+        # Filter to derived_from only.
+        # Prefer the role attribute; fall back to parsing the composite ID
+        # (format: "{project}/{wi_id}/derived_from/{project}/{tp_id}").
+        role = item.get("attributes", {}).get("role", "")
+        if not role:
+            parts = item_id.split("/")
+            role = parts[2] if len(parts) >= 5 else ""
+        if role == "derived_from":
+            linked_ids.add(item_id)
     if debug:
         print(f"    [DEBUG] Existing derived_from links on {tr_short}: {linked_ids}")
     return linked_ids
@@ -436,8 +448,8 @@ def link_tr_to_tp(
     tr_short = extract_short_id(tr_wi_id)
     tp_short = extract_short_id(tp_wi_id)
 
-    # Check if this TP is already linked (match tp_short anywhere in existing link IDs)
-    if any(tp_short in linked_id for linked_id in existing_linked_ids):
+    # Check if this TP is already linked (exact match on the last path segment of the link ID)
+    if any(tp_short == linked_id.split("/")[-1] for linked_id in existing_linked_ids):
         print(f"    ⏭ TR {tr_short} → TP {tp_short} already linked, skipping ({tp_title})")
         return True
 
@@ -474,6 +486,9 @@ def link_tr_to_tp(
     if resp.status_code in (200, 201, 204):
         print(f"    ✓ Linked TR {tr_short} → derived_from → TP {tp_short} ({tp_title})")
         return True
+    elif resp.status_code == 409:
+        print(f"    ⏭ TR {tr_short} → TP {tp_short} already linked (409), skipping ({tp_title})")
+        return True
     else:
         print(f"    ✗ Failed to link TR {tr_short} → TP {tp_short}: {resp.status_code}")
         if verbose:
@@ -482,33 +497,320 @@ def link_tr_to_tp(
 
 
 # ---------------------------------------------------------------------------
+# Phase 2 helpers — TR enumeration, deletion, creation
+# ---------------------------------------------------------------------------
+
+_TR_NUMBER_RE = re.compile(r"_TR_(\d+)$")
+
+
+def find_all_existing_trs_for_function(
+    session: requests.Session,
+    base_url: str,
+    project_id: str,
+    function_name: str,
+    tr_title_prefix: str,
+    verify_ssl: bool,
+    verbose: bool = False,
+    debug: bool = False,
+) -> List[Tuple[str, str, int]]:
+    """
+    Find all existing TRs for *function_name* (any _TR_N suffix).
+    Returns [(wi_full_id, title, tr_number), ...] sorted by tr_number ascending.
+    """
+    query = "type:wi_testResult AND NOT status:deleted AND NOT HAS_VALUE:resolution"
+    search_prefix = f"{tr_title_prefix}{function_name}_TR_"
+    if debug:
+        print(f"    [DEBUG] Searching all TRs with prefix: {search_prefix}")
+
+    wi_ids = query_work_items_paginated(
+        session, base_url, project_id, query, search_prefix,
+        verify_ssl, verbose, debug,
+    )
+
+    results = []
+    for wi_id in wi_ids:
+        short_id = extract_short_id(wi_id)
+        url = f"{base_url}/projects/{project_id}/workitems/{short_id}"
+        resp = session.get(url, params={"fields[workitems]": "title"}, verify=verify_ssl)
+        if resp.status_code != 200:
+            continue
+        title = resp.json().get("data", {}).get("attributes", {}).get("title", "")
+        if not title.startswith(search_prefix):
+            if verbose:
+                print(f"    [VERBOSE] Skipping '{title}' — does not start with {search_prefix}")
+            continue
+        m = _TR_NUMBER_RE.search(title)
+        if m:
+            results.append((wi_id, title, int(m.group(1))))
+        elif verbose:
+            print(f"    [VERBOSE] Skipping '{title}' — no _TR_N suffix found")
+
+    return sorted(results, key=lambda x: x[2])
+
+
+def delete_tr_tp_links(
+    session: requests.Session,
+    base_url: str,
+    project_id: str,
+    tr_wi_id: str,
+    verify_ssl: bool,
+    dry_run: bool = True,
+    verbose: bool = False,
+    debug: bool = False,
+) -> int:
+    """
+    Delete all derived_from linked work items from *tr_wi_id*.
+    Returns count deleted (or would-delete in dry-run), -1 on error.
+    """
+    existing = get_existing_linked_tp_ids(
+        session, base_url, project_id, tr_wi_id, verify_ssl, verbose, debug,
+    )
+    if not existing:
+        return 0
+
+    tr_short = extract_short_id(tr_wi_id)
+
+    if dry_run:
+        for link_id in existing:
+            parts = link_id.split("/")
+            tp_short = parts[4] if len(parts) >= 5 else link_id.split("/")[-1]
+            print(f"    [DRY RUN] Would remove derived_from → TP {tp_short}")
+        return len(existing)
+
+    deleted = 0
+    for link_id in existing:
+        # Composite link ID format from GET: "{srcProject}/{srcWI}/{role}/{tgtProject}/{tgtWI}"
+        # DELETE path after /linkedworkitems/ must be: {role}/{tgtProject}/{tgtWI}
+        # (Polarion prepends {project}/{WI}/ internally to match the stored ID)
+        parts = link_id.split("/")
+        if len(parts) >= 5:
+            role = parts[2]
+            target_project = parts[3]
+            target_wi = parts[4]
+        else:
+            # Fallback: skip malformed link IDs
+            if verbose:
+                print(f"    [VERBOSE] Skipping malformed link ID: {link_id}")
+            continue
+        tp_short = target_wi
+        url = f"{base_url}/projects/{project_id}/workitems/{tr_short}/linkedworkitems/{role}/{target_project}/{target_wi}"
+        if debug:
+            print(f"    [DEBUG] DELETE {url}")
+        resp = session.delete(url, verify=verify_ssl)
+        if debug:
+            print(f"    [DEBUG] Response {resp.status_code}")
+        if resp.status_code in (200, 204):
+            deleted += 1
+            if verbose:
+                print(f"    [VERBOSE] Removed derived_from → TP {tp_short}")
+        else:
+            print(f"    ✗ Failed to remove link → TP {tp_short}: {resp.status_code}")
+            if verbose:
+                print(f"      Response: {resp.text[:300]}")
+
+    return deleted
+
+
+def delete_work_item(
+    session: requests.Session,
+    base_url: str,
+    project_id: str,
+    wi_id: str,
+    wi_title: str,
+    verify_ssl: bool,
+    dry_run: bool = True,
+    verbose: bool = False,
+    debug: bool = False,
+) -> bool:
+    """Delete a Polarion work item."""
+    short_id = extract_short_id(wi_id)
+
+    if dry_run:
+        print(f"    [DRY RUN] Would delete TR {short_id} — {wi_title}")
+        return True
+
+    url = f"{base_url}/projects/{project_id}/workitems/{short_id}"
+    if debug:
+        print(f"    [DEBUG] DELETE {url}")
+    resp = session.delete(url, verify=verify_ssl)
+    if debug:
+        print(f"    [DEBUG] Response {resp.status_code}")
+    if resp.status_code in (200, 204):
+        print(f"    ✓ Deleted TR {short_id} — {wi_title}")
+        return True
+    else:
+        print(f"    ✗ Failed to delete TR {short_id}: {resp.status_code}")
+        if verbose:
+            print(f"      Response: {resp.text[:300]}")
+        return False
+
+
+def _create_tr_work_item(
+    session: requests.Session,
+    base_url: str,
+    project_id: str,
+    function_name: str,
+    component: str,
+    tr_title_prefix: str,
+    is_bsp: bool,
+    verify_ssl: bool,
+    tr_number: int,
+    dry_run: bool = True,
+    verbose: bool = False,
+    debug: bool = False,
+) -> Optional[str]:
+    """
+    Create a single new TR work item numbered *tr_number*.
+    Returns the full WI id, 'DRY_RUN' in dry-run mode, or None on failure.
+    """
+    title = f"{tr_title_prefix}{function_name}_TR_{tr_number}"
+    print(f"\n  Creating TR: {title}")
+    print(f"    Component: {component}")
+
+    if dry_run:
+        print(f"    [DRY RUN] Would create work item '{title}'")
+        return "DRY_RUN"
+
+    url = f"{base_url}/projects/{project_id}/workitems"
+    wi_data: dict = {
+        "type": "workitems",
+        "attributes": {
+            "type": "wi_testResult",
+            "title": title,
+            "status": "draft",
+            "fld_component": f"comp_{component}",
+        },
+    }
+    if is_bsp:
+        wi_data["relationships"] = {
+            "categories": {
+                "data": [{"type": "categories", "id": f"{project_id}/cat_BSP_POS"}]
+            },
+            "fld_category": {
+                "data": {"type": "categories", "id": f"{project_id}/cat_BSP_POS"}
+            },
+        }
+    payload = {"data": [wi_data]}
+
+    if verbose:
+        print(f"    [VERBOSE] POST {url}")
+    if debug:
+        print(f"    [DEBUG] Payload: {json.dumps(payload, indent=2)}")
+
+    resp = session.post(url, json=payload, verify=verify_ssl)
+    if debug:
+        print(f"    [DEBUG] Response {resp.status_code}: {resp.text[:500]}")
+    if resp.status_code in (200, 201):
+        resp_data = resp.json().get("data", [])
+        if isinstance(resp_data, list) and resp_data:
+            created_data = resp_data[0]
+        else:
+            created_data = resp_data if isinstance(resp_data, dict) else {}
+        created_id = created_data.get("id", "?")
+        print(f"    ✓ Created: {extract_short_id(created_id)}")
+        return created_id
+    else:
+        print(f"    ✗ Error creating work item: {resp.status_code}")
+        print(f"      Response: {resp.text[:500]}")
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Phase 4 — Discover log files
 # ---------------------------------------------------------------------------
+
+def find_most_recent_run_folder(
+    repo_path: str,
+    component_dir: str,
+    verbose: bool = False,
+) -> Optional[str]:
+    """
+    Among the immediate subdirectories of *component_dir*, return the absolute
+    path of the one most recently committed in git.  Falls back to filesystem
+    mtime if git has no record for any subfolder.
+    Returns None if *component_dir* has no subdirectories.
+    """
+    try:
+        entries = sorted(
+            e for e in os.listdir(component_dir)
+            if os.path.isdir(os.path.join(component_dir, e))
+        )
+    except OSError:
+        return None
+    if not entries:
+        return None
+    if len(entries) == 1:
+        return os.path.join(component_dir, entries[0])
+
+    latest_time = -1
+    latest_dir: Optional[str] = None
+    for entry in entries:
+        abs_dir = os.path.join(component_dir, entry)
+        rel_dir = os.path.relpath(abs_dir, repo_path).replace("\\", "/")
+        result = subprocess.run(
+            ["git", "log", "-1", "--format=%at", "--", f"{rel_dir}/"],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            try:
+                t = int(result.stdout.strip())
+                if verbose:
+                    print(f"  [VERBOSE] Run folder '{entry}' last commit timestamp: {t}")
+                if t > latest_time:
+                    latest_time = t
+                    latest_dir = abs_dir
+            except ValueError:
+                pass
+
+    if latest_dir:
+        return latest_dir
+
+    # Fallback: filesystem mtime
+    if verbose:
+        print("  [VERBOSE] No git history found for run folders, falling back to filesystem mtime")
+    return max(
+        (os.path.join(component_dir, e) for e in entries),
+        key=lambda p: os.path.getmtime(p),
+    )
+
 
 def discover_log_files(
     repo_path: str,
     component: str,
     is_bsp: bool,
+    formal: bool = False,
     verbose: bool = False,
 ) -> Tuple[List[str], List[Tuple[str, str]]]:
     """
-    Recursively search for log files under the component directory.
+    Recursively search for log files under the most recently git-committed run
+    subfolder of the component directory.
 
     Returns:
-        plain_logs: list of absolute paths to .log files
-        zip_logs: list of (zip_abs_path, entry_name) for .log entries inside .zip files
+        plain_logs: list of absolute paths to .log/.txt files
+        zip_logs: list of (zip_abs_path, entry_name) for .log/.txt entries inside .zip files
     """
-    search_root = os.path.join(repo_path, "Informal_Test_Results", "Automated", component)
+    folder = "Formal_Test_Results" if formal else "Informal_Test_Results"
+    search_root = os.path.join(repo_path, folder, "Automated", component)
     if not os.path.isdir(search_root):
         print(f"  ⚠ Log directory not found: {search_root}")
         return [], []
 
-    print(f"  Searching for logs under: {search_root}")
+    # Restrict to the most recently git-committed run subfolder
+    walk_root = find_most_recent_run_folder(repo_path, search_root, verbose=verbose)
+    if walk_root:
+        run_name = os.path.basename(walk_root)
+        print(f"  Most recent run folder : {run_name}")
+        print(f"  Searching for logs under: {walk_root}")
+    else:
+        walk_root = search_root
+        print(f"  Searching for logs under: {walk_root}")
 
     plain_logs: List[str] = []
     zip_logs: List[Tuple[str, str]] = []
 
-    for dirpath, _dirnames, filenames in os.walk(search_root):
+    for dirpath, _dirnames, filenames in os.walk(walk_root):
         for fname in filenames:
             fpath = os.path.join(dirpath, fname)
             if fname.lower().endswith((".log", ".txt")):
@@ -608,6 +910,70 @@ def match_logs_to_trs(
     return func_logs
 
 
+def match_logs_per_file(
+    plain_logs: List[str],
+    zip_logs: List[Tuple[str, str]],
+    tc_by_function: Dict[str, List[str]],
+    repo_path: str,
+    verbose: bool = False,
+) -> Dict[str, List[Tuple[str, List[str]]]]:
+    """
+    Scan each log file and record which TC titles appear in it, per function.
+    Unlike match_logs_to_trs, this preserves per-file granularity so that
+    each log can be assigned to a separate TR.
+    Returns {function_name: [(rel_log_path, [matched_tc_titles]), ...]}
+    sorted by rel_log_path within each function.
+    """
+    tc_to_func: Dict[str, str] = {}
+    for func, titles in tc_by_function.items():
+        for t in titles:
+            tc_to_func[t] = func
+
+    all_tc_names = list(tc_to_func.keys())
+    # {func: {rel_path: set of matched tc_titles}}
+    func_path_tcs: Dict[str, Dict[str, set]] = {}
+
+    # Plain .log / .txt files
+    for log_path in plain_logs:
+        content = _read_log_content(log_path)
+        if not content:
+            continue
+        rel = _build_relative_log_path(log_path, repo_path)
+        matched_funcs: set = set()
+        for tc_name in all_tc_names:
+            if tc_name in content:
+                f = tc_to_func[tc_name]
+                func_path_tcs.setdefault(f, {}).setdefault(rel, set()).add(tc_name)
+                matched_funcs.add(f)
+        if verbose and matched_funcs:
+            print(f"    [VERBOSE] Log '{rel}' matched function(s): {', '.join(sorted(matched_funcs))}")
+
+    # Zip logs — aggregate all matching entries within a zip into one entry per (func, zip)
+    for zip_path, entry_name in zip_logs:
+        content = _read_zip_log_content(zip_path, entry_name)
+        if not content:
+            continue
+        rel = _build_relative_log_path(zip_path, repo_path)
+        matched_funcs = set()
+        for tc_name in all_tc_names:
+            if tc_name in content:
+                f = tc_to_func[tc_name]
+                func_path_tcs.setdefault(f, {}).setdefault(rel, set()).add(tc_name)
+                matched_funcs.add(f)
+        if verbose and matched_funcs:
+            print(f"    [VERBOSE] Zip entry '{rel}!{entry_name}' matched function(s): {', '.join(sorted(matched_funcs))}")
+
+    # Convert to sorted list of (rel_path, sorted_tc_list)
+    result: Dict[str, List[Tuple[str, List[str]]]] = {}
+    for func, path_map in func_path_tcs.items():
+        result[func] = sorted(
+            [(rel, sorted(tc_set)) for rel, tc_set in path_map.items()],
+            key=lambda x: x[0],
+        )
+
+    return result
+
+
 def update_tr_hyperlinks(
     session: requests.Session,
     base_url: str,
@@ -616,36 +982,33 @@ def update_tr_hyperlinks(
     log_urls: List[str],
     verify_ssl: bool,
     dry_run: bool = True,
+    formal: bool = False,
     verbose: bool = False,
     debug: bool = False,
 ) -> bool:
     tr_short = extract_short_id(tr_wi_id)
-
-    if dry_run:
-        for url in log_urls:
-            print(f"    [DRY RUN] Would add hyperlink ref_src → {url}")
-        return True
-
-    # Fetch existing hyperlinks to preserve them
     wi_url = f"{base_url}/projects/{project_id}/workitems/{tr_short}"
+
+    # Always fetch existing hyperlinks — needed to show removals in dry-run
+    # and to preserve non-ref_src links in live mode.
     params = {"fields[workitems]": "hyperlinks"}
     resp = session.get(wi_url, params=params, verify=verify_ssl)
     existing_links = []
     if resp.status_code == 200:
         existing_links = resp.json().get("data", {}).get("attributes", {}).get("hyperlinks", [])
 
-    existing_uris = {link.get("uri", "") for link in existing_links}
-    new_links = list(existing_links)
-    added = 0
-    for url in log_urls:
-        if url not in existing_uris:
-            new_links.append({"role": "ref_src", "uri": url})
-            added += 1
+    existing_ref_src = [lnk for lnk in existing_links if lnk.get("role") == "ref_src"]
+    non_ref_src = [lnk for lnk in existing_links if lnk.get("role") != "ref_src"]
 
-    if added == 0:
-        print(f"    All log hyperlinks already present on {tr_short}, skipping update")
+    if dry_run:
+        for lnk in existing_ref_src:
+            print(f"    [DRY RUN] Would remove ref_src → {lnk.get('uri', '?')}")
+        for url in log_urls:
+            print(f"    [DRY RUN] Would add ref_src → {url}")
         return True
 
+    # Replace all existing ref_src with the current run's log URLs
+    new_links = non_ref_src + [{"role": "ref_src", "uri": url} for url in log_urls]
     patch_payload = {
         "data": {
             "type": "workitems",
@@ -663,12 +1026,13 @@ def update_tr_hyperlinks(
     if debug:
         print(f"    [DEBUG] Response {resp.status_code}: {resp.text[:300]}")
     if resp.status_code in (200, 204):
-        print(f"    ✓ Added {added} log hyperlink(s) to TR {tr_short}")
+        print(f"    ✓ Removed {len(existing_ref_src)} old ref_src link(s), added {len(log_urls)} link(s) to TR {tr_short}")
         return True
     else:
         print(f"    ✗ Failed to update hyperlinks on TR {tr_short}: {resp.status_code}")
         if verbose:
             print(f"      Response: {resp.text[:300]}")
+        return False
         return False
 
 
@@ -706,6 +1070,11 @@ Examples:
         help="One or more function prefixes to search TCs (e.g. nvme_qpair_ nvme_ctrlr_cmd). "
              "If omitted, all TCs for the component are used — fails if ≥100 are found.",
     )
+    parser.add_argument(
+        "--formal", action="store_true", default=False,
+        help="Use Formal_Test_Results instead of Informal_Test_Results and replace all "
+             "ref_src hyperlinks on TRs with links to the formal log files.",
+    )
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument(
         "--dry-run", action="store_true", default=True,
@@ -734,6 +1103,7 @@ Examples:
 
     args = parser.parse_args()
     dry_run = not args.execute
+    is_formal = args.formal
     if args.debug:
         args.verbose = True
 
@@ -762,6 +1132,12 @@ Examples:
         print(f"Error: INTEGRATION_REPO_PATH does not exist: {integration_repo_path}")
         sys.exit(1)
 
+    if is_formal:
+        formal_dir = os.path.join(integration_repo_path, "Formal_Test_Results", "Automated", args.component)
+        if not os.path.isdir(formal_dir):
+            print(f"Error: Formal_Test_Results directory not found: {formal_dir}")
+            sys.exit(1)
+
     # ---- Repository selection ----
     is_bsp = args.bsp
     if is_bsp:
@@ -782,6 +1158,8 @@ Examples:
     print(f"Component  : {args.component}")
     print(f"Pattern(s) : {', '.join(args.pattern) if args.pattern else '(none — all TCs)'}")
     print(f"Project    : {project_id}")
+    if is_formal:
+        print(f"Formal     : ON (Formal_Test_Results, ref_src links will be replaced)")
     if args.debug:
         print(f"Debug      : ON")
     print("=" * 60)
@@ -861,117 +1239,168 @@ Examples:
             print(f"      - {tc}")
 
     # ==================================================================
-    # Phase 2 — Create or reuse Test Results
-    # ==================================================================
-    print(f"\nPhase 2: Resolving Test Results (create new or reuse existing)")
-    tr_map: Dict[str, Optional[str]] = {}  # function_name → TR WI id
-    trs_created = 0
-    trs_reused = 0
-
-    for func in sorted(tc_by_function):
-        tr_id, is_new = get_or_create_test_result(
-            session, base_url, project_id, func, args.component, tr_title_prefix,
-            is_bsp, args.verify_ssl, dry_run=dry_run, verbose=args.verbose,
-            debug=args.debug,
-        )
-        tr_map[func] = tr_id
-        if tr_id:
-            if is_new:
-                trs_created += 1
-            else:
-                trs_reused += 1
-
-    # ==================================================================
-    # Phase 3 — Link TR → TP (derived_from)
-    # ==================================================================
-    print(f"\nPhase 3: Linking TRs to Test Procedures (derived_from)")
-    tp_links_created = 0
-
-    for func in sorted(tc_by_function):
-        tr_id = tr_map.get(func)
-        if not tr_id:
-            print(f"  Skipping TP linking for '{func}' — TR creation failed")
-            continue
-
-        tr_short = extract_short_id(tr_id) if tr_id != "DRY_RUN" else f"{tr_title_prefix}{func}_TR_1"
-        print(f"\n  TR {tr_short}: finding TPs that implement TCs of function '{func}'")
-
-        # Collect TC WI IDs for this function
-        tc_wi_ids = [tc_title_to_id[t] for t in tc_by_function[func] if t in tc_title_to_id]
-        if not tc_wi_ids:
-            print(f"    No TC WI IDs available for function '{func}'")
-            continue
-
-        tps = find_tps_for_tcs(
-            session, base_url, project_id, tc_wi_ids,
-            args.verify_ssl, verbose=args.verbose, debug=args.debug,
-        )
-
-        if not tps:
-            print(f"    No TPs found for function '{func}'")
-            continue
-
-        print(f"    Found {len(tps)} TP(s)")
-
-        # Fetch existing links once per TR to avoid duplicates
-        existing_linked_ids = set()
-        if tr_id != "DRY_RUN":
-            existing_linked_ids = get_existing_linked_tp_ids(
-                session, base_url, project_id, tr_id,
-                args.verify_ssl, verbose=args.verbose, debug=args.debug,
-            )
-
-        for tp_id, tp_title in tps:
-            ok = link_tr_to_tp(
-                session, base_url, project_id, tr_id, tp_id, tp_title,
-                existing_linked_ids,
-                args.verify_ssl, dry_run=dry_run, verbose=args.verbose,
-                debug=args.debug,
-            )
-            if ok:
-                tp_links_created += 1
-
-    # ==================================================================
-    # Phase 4 — Discover log files
+    # Phase 4 (moved) — Discover log files
     # ==================================================================
     print(f"\nPhase 4: Discovering log files")
     plain_logs, zip_logs = discover_log_files(
-        integration_repo_path, args.component, is_bsp, verbose=args.verbose,
+        integration_repo_path, args.component, is_bsp, formal=is_formal, verbose=args.verbose,
+    )
+
+    # Match each log file to functions and record which TC titles appear in it
+    func_log_data = match_logs_per_file(
+        plain_logs, zip_logs, tc_by_function,
+        integration_repo_path, verbose=args.verbose,
     )
 
     # ==================================================================
-    # Phase 5 — Link logs → TR
+    # Phase 2 — Resolve Test Results (one TR per log file per function)
     # ==================================================================
-    print(f"\nPhase 5: Matching logs to TRs and creating hyperlinks")
-    log_links_created = 0
+    print(f"\nPhase 2: Resolving Test Results (one TR per log file per function)")
+    # {func: [(tr_wi_id_or_None, rel_log_path_or_None, [matched_tc_titles]), ...]}
+    func_tr_assignments: Dict[str, List[Tuple[Optional[str], Optional[str], List[str]]]] = {}
+    trs_created = 0
+    trs_reused = 0
+    trs_deleted = 0
 
-    if plain_logs or zip_logs:
-        func_logs = match_logs_to_trs(
-            plain_logs, zip_logs, tc_by_function,
-            integration_repo_path, verbose=args.verbose,
+    for func in sorted(tc_by_function):
+        log_entries = func_log_data.get(func, [])  # [(rel_path, [tc_titles]), ...]
+
+        if not log_entries:
+            if args.verbose:
+                print(f"\n  Function '{func}': no log files found — existing TRs preserved unchanged")
+            func_tr_assignments[func] = []
+            continue
+
+        existing_trs = find_all_existing_trs_for_function(
+            session, base_url, project_id, func, tr_title_prefix,
+            args.verify_ssl, verbose=args.verbose, debug=args.debug,
         )
+        existing_by_num = {t[2]: (t[0], t[1]) for t in existing_trs}
 
-        for func in sorted(func_logs):
-            tr_id = tr_map.get(func)
+        assignments: List[Tuple[Optional[str], Optional[str], List[str]]] = []
+
+        for i, (rel_path, tc_titles) in enumerate(log_entries):
+            tr_number = i + 1
+            if tr_number in existing_by_num:
+                tr_id, tr_title = existing_by_num[tr_number]
+                print(f"\n  Existing TR {tr_number}: {extract_short_id(tr_id)} — {tr_title}")
+                print(f"    Reusing for function '{func}'")
+                assignments.append((tr_id, rel_path, tc_titles))
+                trs_reused += 1
+            else:
+                tr_id = _create_tr_work_item(
+                    session, base_url, project_id, func, args.component,
+                    tr_title_prefix, is_bsp, args.verify_ssl,
+                    tr_number=tr_number, dry_run=dry_run,
+                    verbose=args.verbose, debug=args.debug,
+                )
+                assignments.append((tr_id, rel_path, tc_titles))
+                if tr_id or dry_run:
+                    trs_created += 1
+
+        # Delete surplus TRs (numbers above the current log count)
+        for wi_id, title, num in existing_trs:
+            if num > len(log_entries):
+                print(f"\n  Deleting surplus TR: {extract_short_id(wi_id)} — {title}")
+                ok = delete_work_item(
+                    session, base_url, project_id, wi_id, title,
+                    args.verify_ssl, dry_run=dry_run,
+                    verbose=args.verbose, debug=args.debug,
+                )
+                if ok:
+                    trs_deleted += 1
+
+        func_tr_assignments[func] = assignments
+
+    # ==================================================================
+    # Phase 3 — Replace TR → TP links based on log content
+    # ==================================================================
+    print(f"\nPhase 3: Replacing TR → TP links (derived_from, per-log)")
+    tp_links_created = 0
+
+    for func in sorted(func_tr_assignments):
+        for idx, (tr_id, rel_log_path, tc_titles) in enumerate(func_tr_assignments[func]):
             if not tr_id:
-                print(f"  Skipping log linking for '{func}' — TR not available")
+                continue
+            tr_number = idx + 1
+            tr_short = (
+                extract_short_id(tr_id) if tr_id != "DRY_RUN"
+                else f"{tr_title_prefix}{func}_TR_{tr_number}"
+            )
+            log_label = rel_log_path or "(no log)"
+            print(f"\n  TR {tr_short}: TP links for '{func}' (log: {log_label})")
+
+            # Remove all existing derived_from links first
+            if tr_id != "DRY_RUN":
+                deleted = delete_tr_tp_links(
+                    session, base_url, project_id, tr_id,
+                    args.verify_ssl, dry_run=dry_run,
+                    verbose=args.verbose, debug=args.debug,
+                )
+                if deleted > 0:
+                    print(f"    Removed {deleted} existing derived_from link(s)")
+            else:
+                print(f"    [DRY RUN] Would remove existing derived_from links")
+
+            if not tc_titles:
+                print(f"    No log content — skipping TP linking")
                 continue
 
-            rel_paths = func_logs[func]
-            log_urls = [f"{gitlab_base}/{rel}" for rel in rel_paths]
+            tc_wi_ids = [tc_title_to_id[t] for t in tc_titles if t in tc_title_to_id]
+            if not tc_wi_ids:
+                print(f"    No TC WI IDs resolved")
+                continue
 
-            tr_short = extract_short_id(tr_id) if tr_id != "DRY_RUN" else f"{tr_title_prefix}{func}_TR_1"
-            print(f"\n  TR {tr_short}: {len(log_urls)} log reference(s) for function '{func}'")
+            tps = find_tps_for_tcs(
+                session, base_url, project_id, tc_wi_ids,
+                args.verify_ssl, verbose=args.verbose, debug=args.debug,
+            )
+
+            if not tps:
+                print(f"    No TPs found for TCs in this log")
+                continue
+
+            print(f"    Found {len(tps)} TP(s)")
+
+            for tp_id, tp_title in tps:
+                ok = link_tr_to_tp(
+                    session, base_url, project_id, tr_id, tp_id, tp_title,
+                    set(),  # existing links cleared above; 409 guard still active
+                    args.verify_ssl, dry_run=dry_run,
+                    verbose=args.verbose, debug=args.debug,
+                )
+                if ok:
+                    tp_links_created += 1
+
+    # ==================================================================
+    # Phase 5 — Set exactly one ref_src hyperlink per TR
+    # ==================================================================
+    print(f"\nPhase 5: Setting log hyperlinks (one ref_src per TR)")
+    log_links_created = 0
+
+    for func in sorted(func_tr_assignments):
+        for idx, (tr_id, rel_log_path, _) in enumerate(func_tr_assignments[func]):
+            if not tr_id:
+                continue
+            tr_number = idx + 1
+            tr_short = (
+                extract_short_id(tr_id) if tr_id != "DRY_RUN"
+                else f"{tr_title_prefix}{func}_TR_{tr_number}"
+            )
+            if not rel_log_path:
+                print(f"\n  TR {tr_short}: no log file — skipping ref_src")
+                continue
+
+            log_url = f"{gitlab_base}/{rel_log_path}"
+            print(f"\n  TR {tr_short}: ref_src → {rel_log_path}")
 
             ok = update_tr_hyperlinks(
-                session, base_url, project_id, tr_id, log_urls,
-                args.verify_ssl, dry_run=dry_run, verbose=args.verbose,
-                debug=args.debug,
+                session, base_url, project_id, tr_id, [log_url],
+                args.verify_ssl, dry_run=dry_run, formal=is_formal,
+                verbose=args.verbose, debug=args.debug,
             )
             if ok:
-                log_links_created += len(log_urls)
-    else:
-        print("  No log files found — skipping log linking")
+                log_links_created += 1
 
     # ==================================================================
     # Summary
@@ -982,9 +1411,10 @@ Examples:
     print(f"  Functions identified : {len(tc_by_function)}")
     print(f"  Test Results created : {trs_created}")
     print(f"  Test Results reused  : {trs_reused}")
-    print(f"  TR → TP links        : {tp_links_created}")
+    print(f"  Test Results deleted : {trs_deleted}")
+    print(f"  TR → TP links set    : {tp_links_created}")
     print(f"  Log files discovered : {len(plain_logs) + len(zip_logs)}")
-    print(f"  Log → TR hyperlinks  : {log_links_created}")
+    print(f"  Log → TR ref_src set : {log_links_created}")
     if dry_run:
         print(f"\nThis was a DRY RUN. Use --execute to apply changes.")
     print("=" * 60)
