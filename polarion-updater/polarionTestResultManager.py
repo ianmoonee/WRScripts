@@ -116,7 +116,7 @@ def query_work_items_paginated(
 
 
 # ---------------------------------------------------------------------------
-# Phase 1 — Fetch Test Cases
+# Phase 1 — Discover functions and fetch TCs
 # ---------------------------------------------------------------------------
 
 _TC_LEVEL_RE = re.compile(r"_(LLTC|HLTC)_\d+$")
@@ -129,83 +129,92 @@ def extract_function_name(tc_title: str) -> Optional[str]:
     return None
 
 
-def fetch_test_cases(
+def discover_function_names(
     session: requests.Session,
     base_url: str,
     project_id: str,
-    patterns: List[str],
     component: str,
     verify_ssl: bool,
     verbose: bool = False,
     debug: bool = False,
-) -> Tuple[Dict[str, List[str]], Dict[str, str]]:
+) -> List[str]:
+    """Discover all unique function names from TCs for *component*.
+
+    Uses paginated prefix-splitting to handle any number of TCs
+    (no 100-item cap).  Returns a sorted list of function names.
     """
-    Fetch TCs whose titles start with any of the given *patterns* and group
-    them by function name.  Filters by *component*.
-    Returns (tc_by_function, tc_title_to_id):
-        tc_by_function: {function_name: [tc_title, ...]}
-        tc_title_to_id: {tc_title: wi_full_id}
-    """
-    all_wi_ids: set = set()
+    base_query = (
+        f"type:wi_testCase AND NOT status:deleted AND NOT HAS_VALUE:resolution"
+        f" AND fld_component.KEY:comp_{component}"
+    )
 
-    base_query = f"type:wi_testCase AND NOT status:deleted AND NOT HAS_VALUE:resolution AND fld_component.KEY:comp_{component}"
+    wi_ids = query_work_items_paginated(
+        session, base_url, project_id, base_query, "",
+        verify_ssl, verbose, debug,
+    )
+    print(f"  Total TC work items found: {len(wi_ids)}")
 
-    if not patterns:
-        # No pattern — single unfiltered query (count already verified in main)
-        _url = f"{base_url}/projects/{project_id}/workitems"
-        _params = {"query": base_query, "fields[workitems]": "id"}
-        if debug:
-            print(f"  [DEBUG] GET {_url} params={_params}")
-        _resp = session.get(_url, params=_params, verify=verify_ssl)
-        if _resp.status_code == 200:
-            items = _resp.json().get("data", [])
-            all_wi_ids.update(item["id"] for item in items if isinstance(item, dict) and "id" in item)
-        print(f"  Total WI IDs (no pattern filter): {len(all_wi_ids)}")
-    else:
-        for pattern in patterns:
-            print(f"  Pattern: {pattern}")
-
-            wi_ids = query_work_items_paginated(
-                session, base_url, project_id, base_query, pattern,
-                verify_ssl, verbose, debug
-            )
-            print(f"    → {len(wi_ids)} WI(s) found")
-
-            all_wi_ids.update(wi_ids)
-
-        print(f"  Total unique WI IDs across all patterns: {len(all_wi_ids)}")
-
-    # Fetch titles and verify pattern match against at least one pattern
-    tc_titles: List[str] = []
-    tc_title_to_id: Dict[str, str] = {}
-    for wi_id in all_wi_ids:
+    # Fetch titles and extract function names
+    functions: set = set()
+    for wi_id in wi_ids:
         short_id = extract_short_id(wi_id)
         url = f"{base_url}/projects/{project_id}/workitems/{short_id}"
-        params = {"fields[workitems]": "title"}
-        if debug:
-            print(f"  [DEBUG] GET {url}")
-        resp = session.get(url, params=params, verify=verify_ssl)
+        resp = session.get(url, params={"fields[workitems]": "title"}, verify=verify_ssl)
         if resp.status_code != 200:
             if verbose:
                 print(f"  [VERBOSE] Could not fetch {short_id}: {resp.status_code}")
             continue
         title = resp.json().get("data", {}).get("attributes", {}).get("title", "")
-        if not patterns or any(p in title for p in patterns):
-            tc_titles.append(title)
-            tc_title_to_id[title] = wi_id
-        elif verbose:
-            print(f"  [VERBOSE] Skipping '{title}' — does not contain any pattern")
-
-    # Group by function name
-    grouped: Dict[str, List[str]] = {}
-    for title in sorted(tc_titles):
         func = extract_function_name(title)
         if func:
-            grouped.setdefault(func, []).append(title)
+            functions.add(func)
         elif verbose:
             print(f"  [VERBOSE] Could not extract function name from '{title}'")
 
-    return grouped, tc_title_to_id
+    return sorted(functions)
+
+
+def fetch_tcs_for_function(
+    session: requests.Session,
+    base_url: str,
+    project_id: str,
+    function_name: str,
+    component: str,
+    verify_ssl: bool,
+    verbose: bool = False,
+    debug: bool = False,
+) -> Dict[str, str]:
+    """Fetch all TCs for a specific *function_name* within *component*.
+
+    Uses paginated prefix-splitting to handle >100 TCs per function.
+    Returns {tc_title: wi_full_id}.
+    """
+    base_query = (
+        f"type:wi_testCase AND NOT status:deleted AND NOT HAS_VALUE:resolution"
+        f" AND fld_component.KEY:comp_{component}"
+    )
+
+    # Query with function_name + "_" to match _HLTC_N and _LLTC_N suffixes
+    wi_ids = query_work_items_paginated(
+        session, base_url, project_id, base_query, f"{function_name}_",
+        verify_ssl, verbose, debug,
+    )
+
+    result: Dict[str, str] = {}
+    for wi_id in wi_ids:
+        short_id = extract_short_id(wi_id)
+        url = f"{base_url}/projects/{project_id}/workitems/{short_id}"
+        resp = session.get(url, params={"fields[workitems]": "title"}, verify=verify_ssl)
+        if resp.status_code != 200:
+            continue
+        title = resp.json().get("data", {}).get("attributes", {}).get("title", "")
+        extracted = extract_function_name(title)
+        if extracted == function_name:
+            result[title] = wi_id
+        elif verbose:
+            print(f"  [VERBOSE] Skipping '{title}' — function '{extracted}' != '{function_name}'")
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1067,8 +1076,8 @@ Examples:
     )
     parser.add_argument(
         "--pattern", nargs="*", default=[],
-        help="One or more function prefixes to search TCs (e.g. nvme_qpair_ nvme_ctrlr_cmd). "
-             "If omitted, all TCs for the component are used — fails if ≥100 are found.",
+        help="One or more function prefixes to filter discovered functions (e.g. nvme_qpair_ nvme_ctrlr_cmd). "
+             "If omitted, all functions for the component are processed.",
     )
     parser.add_argument(
         "--formal", action="store_true", default=False,
@@ -1192,51 +1201,46 @@ Examples:
         sys.exit(1)
 
     # ==================================================================
-    # No-pattern guard — verify TC count is manageable before proceeding
+    # Phase 1 — Discover functions and fetch TCs
     # ==================================================================
-    if not args.pattern:
-        print(f"\nNo --pattern specified: checking TC count for component '{args.component}'...")
-        _url = f"{base_url}/projects/{project_id}/workitems"
-        _query = (
-            f"type:wi_testCase AND NOT status:deleted AND NOT HAS_VALUE:resolution"
-            f" AND fld_component.KEY:comp_{args.component}"
-        )
-        _resp = session.get(_url, params={"query": _query, "fields[workitems]": "id"}, verify=args.verify_ssl)
-        if _resp.status_code != 200:
-            print(f"  Error: Could not count TCs ({_resp.status_code}). Aborting.")
-            sys.exit(1)
-        _count = len(_resp.json().get("data", []))
-        if _count >= 100:
-            print(f"  Error: Component '{args.component}' has ≥100 Test Cases "
-                  f"(API returned {_count}, likely more exist).")
-            print("  Please use --pattern to narrow the search to a specific function prefix.")
-            sys.exit(1)
-        print(f"  {_count} TC(s) found — proceeding without pattern filter")
-
-    # ==================================================================
-    # Phase 1 — Fetch Test Cases
-    # ==================================================================
-    if args.pattern:
-        patterns_display = ', '.join(f"'{p}*'" for p in args.pattern)
-        print(f"\nPhase 1: Fetching Test Cases matching {patterns_display}")
-    else:
-        print(f"\nPhase 1: Fetching all Test Cases for component '{args.component}'")
-    tc_by_function, tc_title_to_id = fetch_test_cases(
-        session, base_url, project_id, args.pattern, args.component,
+    print(f"\nPhase 1a: Discovering functions for component '{args.component}'")
+    all_functions = discover_function_names(
+        session, base_url, project_id, args.component,
         args.verify_ssl, verbose=args.verbose, debug=args.debug,
     )
 
-    total_tcs = sum(len(v) for v in tc_by_function.values())
-    if not tc_by_function:
-        print("  No matching Test Cases found. Nothing to do.")
+    # Filter by pattern if specified
+    if args.pattern:
+        all_functions = [f for f in all_functions if any(p in f for p in args.pattern)]
+        print(f"  Filtered to {len(all_functions)} function(s) matching: {', '.join(args.pattern)}")
+    else:
+        print(f"  Found {len(all_functions)} function(s)")
+
+    if not all_functions:
+        print("  No matching functions found. Nothing to do.")
         return
 
-    print(f"\n  Found {total_tcs} TC(s) across {len(tc_by_function)} function(s):")
-    for func in sorted(tc_by_function):
-        tcs = tc_by_function[func]
-        print(f"    {func}: {len(tcs)} TC(s)")
-        for tc in tcs:
-            print(f"      - {tc}")
+    print(f"\nPhase 1b: Fetching TCs function by function")
+    tc_by_function: Dict[str, List[str]] = {}
+    tc_title_to_id: Dict[str, str] = {}
+    for func in all_functions:
+        func_tcs = fetch_tcs_for_function(
+            session, base_url, project_id, func, args.component,
+            args.verify_ssl, verbose=args.verbose, debug=args.debug,
+        )
+        if func_tcs:
+            tc_by_function[func] = sorted(func_tcs.keys())
+            tc_title_to_id.update(func_tcs)
+            print(f"    {func}: {len(func_tcs)} TC(s)")
+        elif args.verbose:
+            print(f"    {func}: 0 TCs")
+
+    total_tcs = sum(len(v) for v in tc_by_function.values())
+    if not tc_by_function:
+        print("  No Test Cases found. Nothing to do.")
+        return
+
+    print(f"\n  Total: {total_tcs} TC(s) across {len(tc_by_function)} function(s)")
 
     # ==================================================================
     # Phase 4 (moved) — Discover log files

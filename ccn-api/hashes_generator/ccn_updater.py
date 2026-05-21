@@ -239,6 +239,17 @@ def _overflow_filename(mode, component, review_id, field_name):
     )
 
 
+def field_name_to_slug(field_name):
+    """Convert a field name to a filename-safe slug.
+
+    Uses the known suffix mapping for dynamic fields, otherwise
+    lowercases and replaces non-word characters with hyphens.
+    """
+    if field_name in _DYNAMIC_FIELD_SUFFIXES:
+        return _DYNAMIC_FIELD_SUFFIXES[field_name]
+    return re.sub(r'[^\w]+', '-', field_name).strip('-').lower()
+
+
 # =========================================================================
 # Fallback helpers — used when the normal JSON API cannot fully access a CCR
 # (e.g. completed/archived reviews where getReviewSummary fails).
@@ -322,10 +333,11 @@ def resolve_branch_from_mr(mr_number, debug=False):
 def get_files_from_branch(branch_name, wassp_path, debug=False):
     """Get the list of files changed on a branch using git.
 
-    Uses 'git log' on the branch to list all files with non-merge commits.
+    Uses 'git log origin/main..origin/<branch>' to list only files changed
+    by the branch's own commits (not the full ancestry).
     Returns a list of file paths, or an empty list on failure.
     """
-    ref = "origin/" + branch_name
+    ref = "origin/main..origin/" + branch_name
     cmd = ["git", "log", ref, "--no-merges", "--name-only", "--pretty=format:"]
     if debug:
         print("[DEBUG] get_files_from_branch cmd: {}".format(" ".join(cmd)))
@@ -459,6 +471,13 @@ parser.add_argument(
     default=None,
     help="Component name for overflow file naming (e.g. SSD_NVME0). Required when any field exceeds 4000 characters.",
 )
+parser.add_argument(
+    "--file-base",
+    type=str,
+    default=None,
+    help="Base name for overflow output files (e.g. 'Wind_River_Shallowford_BSP_-_SSD_NVME0_-_TPS_formal-review'). "
+         "When set, overflow files are named <file-base>-CCR<id>-<slug>.txt.",
+)
 args = parser.parse_args()
 
 DRY_RUN = args.dry_run
@@ -466,6 +485,7 @@ DEBUG = args.debug
 UPDATE_MOST_RECENT = args.update_most_recent
 MODE = "bsp" if args.bsp else "bl"
 COMPONENT = args.component
+FILE_BASE = args.file_base
 REVIEW_IDS = sorted(args.review_id, reverse=True)
 
 # --- Resolve config file path ---
@@ -516,18 +536,28 @@ if not os.path.isdir(WASSP_PATH):
 
 session = requests.Session()
 
+
+def api_post(url, **kwargs):
+    """POST to the CCN API with a default 60s timeout."""
+    kwargs.setdefault("timeout", 60)
+    kwargs.setdefault("verify", False)
+    return session.post(url, **kwargs)
+
 # =========================================================================
 # STEP 0 — Fetch latest remote references
 # Ensures local tracking refs are up to date before any git log lookups.
 # =========================================================================
 try:
+    if DEBUG:
+        print("[DEBUG] Running git fetch --all --prune...")
     subprocess.check_output(
-        ["git", "fetch", "--all", "--prune"], stderr=subprocess.PIPE, text=True, cwd=WASSP_PATH
+        ["git", "fetch", "--all", "--prune"], stderr=subprocess.PIPE, text=True, cwd=WASSP_PATH,
+        timeout=120
     )
     if DEBUG:
         print("[DEBUG] git fetch --all --prune succeeded")
-except subprocess.CalledProcessError as e:
-    print("WARNING: git fetch failed: {}".format(e))
+except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+    print("WARNING: git fetch failed or timed out: {}".format(e))
 
 # =========================================================================
 # STEP 1 — Obtain a login ticket
@@ -541,7 +571,7 @@ login_req = [
     }
 ]
 
-resp = session.post(BASE_URL, json=login_req, verify=False)
+resp = api_post(BASE_URL, json=login_req)
 data = resp.json()
 
 # if DEBUG:
@@ -568,7 +598,7 @@ for REVIEW_ID in REVIEW_IDS:
         {"command": "ReviewService.findReviewById", "args": {"reviewId": REVIEW_ID}},
     ]
 
-    resp2 = session.post(BASE_URL, json=validate_req, verify=False)
+    resp2 = api_post(BASE_URL, json=validate_req)
     validate_data = resp2.json()
 
     # Verify authentication succeeded
@@ -622,7 +652,7 @@ for REVIEW_ID in REVIEW_IDS:
             "args": {"reviewId": REVIEW_ID, "clientBuild": "14401"},
         },
     ]
-    resp_sum = session.post(BASE_URL, json=summary_req, verify=False)
+    resp_sum = api_post(BASE_URL, json=summary_req)
     summary_data = resp_sum.json()
 
     review_files = []
@@ -736,13 +766,14 @@ for idx, entry in enumerate(ccr_data):
                 print("[DEBUG] cmd: {}".format(" ".join(cmd)))
             try:
                 out = subprocess.check_output(
-                    cmd, text=True, stderr=subprocess.PIPE, cwd=WASSP_PATH
+                    cmd, text=True, stderr=subprocess.PIPE, cwd=WASSP_PATH,
+                    timeout=30
                 ).strip()
                 if DEBUG:
                     print("[DEBUG] stdout: {!r}".format(out))
                 if out:
                     current_hash = out
-            except subprocess.CalledProcessError as e:
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
                 if DEBUG:
                     print("[DEBUG] git log failed: {}".format(e))
         elif DEBUG:
@@ -758,32 +789,53 @@ for idx, entry in enumerate(ccr_data):
             cmd = ["git", "log", ref, "--no-merges", "-n", "1", "--pretty=format:%h", "--", fp]
             try:
                 out = subprocess.check_output(
-                    cmd, text=True, stderr=subprocess.PIPE, cwd=WASSP_PATH
+                    cmd, text=True, stderr=subprocess.PIPE, cwd=WASSP_PATH,
+                    timeout=30
                 ).strip()
                 if out:
                     prev_hash = out
                     break
-            except subprocess.CalledProcessError:
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
                 continue
 
-        # Fallback: if no older CCR had a commit for this file,
-        # use the oldest commit on the current CCR's own branch.
+        # Fallback 1: if no older CCR had a commit for this file,
+        # use the oldest commit on the current CCR's own branch (scoped to branch-only commits).
         if prev_hash == "N/A" and BRANCH_NAME:
-            ref = "origin/" + BRANCH_NAME
+            ref = "origin/main..origin/" + BRANCH_NAME
             cmd = ["git", "log", ref, "--no-merges", "--pretty=format:%h", "--", fp]
             if DEBUG:
                 print("[DEBUG] prev_hash fallback cmd: {}".format(" ".join(cmd)))
             try:
                 out = subprocess.check_output(
-                    cmd, text=True, stderr=subprocess.PIPE, cwd=WASSP_PATH
+                    cmd, text=True, stderr=subprocess.PIPE, cwd=WASSP_PATH,
+                    timeout=30
                 ).strip()
                 if out:
                     prev_hash = out.splitlines()[-1]
                     if DEBUG:
                         print("[DEBUG] prev_hash fallback result: {!r}".format(prev_hash))
-            except subprocess.CalledProcessError as e:
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
                 if DEBUG:
                     print("[DEBUG] prev_hash fallback failed: {}".format(e))
+
+        # Fallback 2: if the range was empty (e.g., branch already merged to main),
+        # find the commit just before current_hash for this file.
+        if prev_hash == "N/A" and current_hash != "N/A":
+            cmd = ["git", "log", current_hash + "~1", "-n", "1", "--pretty=format:%h", "--", fp]
+            if DEBUG:
+                print("[DEBUG] prev_hash fallback2 cmd: {}".format(" ".join(cmd)))
+            try:
+                out = subprocess.check_output(
+                    cmd, text=True, stderr=subprocess.PIPE, cwd=WASSP_PATH,
+                    timeout=30
+                ).strip()
+                if out:
+                    prev_hash = out
+                    if DEBUG:
+                        print("[DEBUG] prev_hash fallback2 result: {!r}".format(prev_hash))
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                if DEBUG:
+                    print("[DEBUG] prev_hash fallback2 failed: {}".format(e))
 
         file_hashes.append({"path": fp, "current": current_hash, "prev": prev_hash})
 
@@ -939,7 +991,7 @@ for idx, entry in enumerate(ccr_data):
                 print("    {}".format(value))
         print(separator)
     else:
-        resp4 = session.post(BASE_URL, json=update_req, verify=False)
+        resp4 = api_post(BASE_URL, json=update_req)
         update_data = resp4.json()
         if "errors" in update_data[1]:
             print("Update failed:", update_data[1]["errors"])
